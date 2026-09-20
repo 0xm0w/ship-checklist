@@ -47,6 +47,8 @@ Run the auditor with the matching flags, then ask targeted follow-ups only for e
 
 4. **Verdict.** The script's verdict is the verdict: `BLOCKED` (a site-killer gate failed — exit 2), `NOT PRODUCTION GRADE` (< 75 — exit 1), `PRODUCTION GRADE WITH NOTES` (75–89), `PRODUCTION GRADE` (≥ 90 — exit 0). Fast posture: gates clear → SHIP, full stop. Jev's overall noul ≤ 0.2 downgrades a high score; gates override everything; Jev can never rescue a low score.
 
+5. **Present the improvement plan — the score is the half the user already has.** Every report ends with an `IMPROVEMENT PLAN`: each FAIL/WARN and each weak Jev dimension translated into a prioritized fix — **MUST FIX** (blocks launch) / **SHOULD FIX** (costs the score) / **WORTH DOING** (cheap half-credit wins) / **NOT AUDITED** (rerun with the missing flag) / **OPTIONAL** (never scored, keep on radar), each with what was observed, why it matters, and the exact fix — plus a `solid already:` strengths line so the report isn't pure negativity. Walk the user through the top items in order and offer to fix them; don't just relay the number.
+
 ## Decision tree (which items apply to which launch)
 
 | Check | Marketing | Auth'd app | API+docs | Internal tool |

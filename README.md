@@ -55,6 +55,8 @@ FINAL = 0.5 · mechanical + 0.35 · semantic + 0.15 · agentic
 - **Gates override everything**: any site-killer failure → `BLOCKED`, no score softens it. Jev's overall noul can downgrade a high score but never rescue a low one.
 - Bands: ≥90 `PRODUCTION GRADE` · 75–89 `WITH NOTES` · <75 `NOT PRODUCTION GRADE`.
 
+Every report ends with an **improvement plan**, because a score without a plan is trivia: each FAIL/WARN and each weak Jev dimension becomes a prioritized item — `MUST FIX` / `SHOULD FIX` / `WORTH DOING` / `NOT AUDITED` / `OPTIONAL` — with what was observed, why it matters, and the exact fix, plus a `solid already:` strengths line.
+
 Without `TYPESAFE_API_KEY` the audit degrades gracefully to mechanical-only (`--no-jev` forces it). A full Jev pass costs fractions of a cent.
 
 ## As an agent skill

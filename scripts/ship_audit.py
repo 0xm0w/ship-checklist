@@ -146,6 +146,102 @@ JEV_QUESTIONS = {
 }
 
 
+# Remediation knowledge: check id -> (why it matters, how to fix).
+# The score says how bad; this says what to do about it.
+REMEDIATION = {
+    "SECRETS": ("anything in the client build is public to the world",
+                "rotate every flagged key NOW (removal is not rotation), move it server-side, re-scan"),
+    "ENV_IN_HISTORY": ("a committed .env leaks every value it ever held",
+                       "rotate all values in that file, then purge with git filter-repo or accept if rotated"),
+    "ACCESS_PROTECTION": ("everyone except the logged-in owner sees a login page — the site looks dead",
+                          "disable deploy protection in host settings; Vercel: PATCH v9/projects {\"ssoProtection\": null}"),
+    "HTTPS_REDIRECT": ("plain HTTP still serves — strip works, cookies can leak",
+                       "enable force-HTTPS in host settings or add a 301 redirect rule"),
+    "MIXED_CONTENT": ("browsers warn or block plain-HTTP subresources on an HTTPS page",
+                      "switch the listed resources to https:// or bundle them locally"),
+    "SITE_UP": ("the site is unreachable", "fix hosting/DNS first — nothing else can be judged"),
+    "SECURITY_HEADERS": ("missing headers leave clickjacking/MIME-sniffing/referrer leaks open",
+                         "add HSTS, X-Content-Type-Options, frame-ancestors/X-Frame-Options, Referrer-Policy, Permissions-Policy via host config (vercel.json headers, _headers, nginx)"),
+    "COOKIE_FLAGS": ("cookies without Secure/HttpOnly are stealable or injectable",
+                     "set Secure + HttpOnly (+ SameSite) on every cookie the app issues"),
+    "OPS_HIDDEN": ("these fail silently and no scan can see them",
+                   "answer each with the owner + evidence before launch"),
+    "TITLE": ("browser tabs, bookmarks and SERPs show nothing useful",
+              "add a <title> naming the product and page purpose"),
+    "META_DESCRIPTION": ("search engines improvise your snippet without it",
+                         "add a 50-160 char meta description summarizing the page"),
+    "SOCIAL_PREVIEW": ("shares render as a bare link with no card",
+                       "add og:title, og:image 1200x630, twitter:card; verify at opengraph.xyz"),
+    "FAVICON": ("missing favicon reads as unfinished in tabs and bookmarks",
+                "add favicon.ico + apple-touch-icon and confirm both return 200"),
+    "CANONICAL_TAG": ("duplicate-content ambiguity across URL variants",
+                      "add <link rel=canonical> pointing at the preferred URL"),
+    "CANONICAL_HOST": ("apex and www serve independently — SEO splits between them",
+                       "301 one host to the other and canonicalize"),
+    "SITEMAP": ("crawlers discover pages slowly or not at all",
+                "emit sitemap.xml with canonical prod URLs; submit in Search Console"),
+    "ROBOTS": ("no robots.txt means no control over crawling or a place for the sitemap ref",
+               "serve robots.txt (block /api, staging; reference the sitemap)"),
+    "UNIQUE_TITLES": ("duplicate titles collapse pages in SERP and history",
+                      "give each page a distinct title/description"),
+    "LANG": ("screen readers and agents guess the language wrong",
+             "set <html lang>"),
+    "NOT_FOUND": ("bad links land on the homepage pretending to be real (200) — users and crawlers are misled",
+                  "add a branded 404 that returns a real 404 status (Next: not-found.tsx; static hosts: 404.html + correct fallback config)"),
+    "IMG_ALT": ("images are invisible to screen readers and agents",
+                "add descriptive alt attributes (empty alt only for decoration)"),
+    "BROKEN_LINKS": ("dead links burn trust and crawl budget",
+                     "fix or remove the listed URLs"),
+    "VIEWPORT": ("without a viewport meta, mobile renders zoomed-out desktop",
+                 "add <meta name=viewport content=\"width=device-width, initial-scale=1\">"),
+    "REAL_LINKS": ("agents and crawlers can't follow onclick-only navigation",
+                   "use real <a href> for navigation; keep JS handlers as enhancement"),
+    "FORM_LABELS": ("unlabeled inputs are unusable by screen readers and agents",
+                    "add <label for>, aria-label, or wrap inputs in labels"),
+    "TEXTLESS_CONTROLS": ("icon-only buttons with no accessible name are invisible to agents",
+                          "add aria-label or visible text to every control"),
+    "H1": ("the page has no dominant heading — structure is unclear to crawlers and readers",
+           "one h1 per page stating what the page is"),
+    "STRUCTURE": ("flat heading structure hides the content outline",
+                  "use h1-h3 hierarchically"),
+    "CLEAN_TREE": ("uncommitted work can ship (CLI deploys the working tree) or get lost",
+                   "commit or stash; re-run git status until clean"),
+    "SHIPPED": ("unpushed commits mean the repo doesn't match reality; unpulled means you're not testing what's deployed",
+                "git push (and pull) until ahead=0 behind=0"),
+    "BRANCHES": ("merged branches pile up and hide the real work",
+                 "git branch -d <name> for each listed branch"),
+    "WORKTREES": ("dead worktree entries rot the repo state",
+                  "git worktree prune"),
+    "TODO_SCAN": ("TODOs marking unfinished user-facing work ship broken promises",
+                  "close them or ticket them with an owner; Jev's TODO_BLOCKING noul says how bad these samples are"),
+    "SPECS": ("open spec items are decisions not yet made",
+              "decide per item: ship without it (move to backlog) or finish it"),
+    "README": ("a repo without a real README reads as abandoned",
+               "write what/why/how-to-run; no placeholders"),
+    "LICENSE": ("public code without a license is legally unusable by others",
+                "add MIT/Apache-2.0 at repo root"),
+    "GITHUB_META": ("empty About wastes the repo's landing page",
+                    "gh repo edit --description ... --homepage <prod-url> --add-topic ..."),
+    "CI": ("a red latest run means main is broken",
+           "open the failing run, fix, re-merge"),
+    "DOCS": ("no docs at the expected place",
+             "add /docs or pass --docs URL if hosted elsewhere"),
+    "DOCS_STUBS": ("stub sections in shipped docs are worse than no docs",
+                   "write the missing sections or remove the pages"),
+    "OAUTH_PROVIDERS": ("OAuth is in play — its failure modes are silent and user-facing",
+                        "walk the OAuth deep-dive: exact prod redirect URIs, state/PKCE, secrets server-side, account linking decided, one full prod login"),
+}
+
+JEV_FIX = {
+    "COPY_CLARITY": "rewrite titles/headings/copy to name the actual product; remove placeholder text",
+    "CTA_FOCUS": "pick one primary action per page; demote secondary links visually",
+    "META_QUALITY": "write unique, specific meta descriptions per page (50-160 chars)",
+    "TRUST_LEGAL": "publish/complete privacy + terms naming collected data and third parties",
+    "AGENTIC_OPERABILITY": "fix DOM semantics: real hrefs, labeled inputs, named controls, heading structure",
+    "TODO_BLOCKING": "close or ticket the TODOs marking unfinished user-facing work before launch",
+}
+
+
 class Auditor:
     def __init__(self, base_url, timeout):
         self.base = base_url.rstrip("/")
@@ -713,6 +809,52 @@ class Auditor:
                 "overall_noul": overall_noul, "verdict": verdict, "gate_fails": [c["id"] for c in gate_fails],
                 "posture": posture}
 
+    def improvements(self, jev_answers):
+        """The report's second half: what to fix, in priority order. A score
+        without a plan is trivia."""
+        sec_names = {0: "site-killers", 1: "legal+trust", 2: "share+SEO", 3: "quality",
+                     "R": "repo", "D": "docs", "O": "oauth", "A": "agentic"}
+        items = []
+        for c in self.checks:
+            if c["status"] == FAIL:
+                pri = "MUST FIX" if c["gate"] else "SHOULD FIX"
+            elif c["status"] == WARN:
+                pri = "WORTH DOING"
+            elif c["status"] == NA and c["id"] in ("SECRETS", "REPO"):
+                pri = "NOT AUDITED"
+            else:
+                continue
+            why, fix = REMEDIATION.get(c["id"], ("", ""))
+            if pri == "NOT AUDITED":
+                why, fix = ("this check never ran, so a leak or mess could be hiding",
+                            "rerun with --build-dir" if c["id"] == "SECRETS"
+                            else "rerun with --repo /path/to/repo")
+            items.append({"priority": pri, "area": sec_names.get(c["section"], str(c["section"])),
+                          "id": c["id"], "title": c["title"],
+                          "evidence": (c["evidence"] or "")[:220], "why": why, "fix": fix})
+        if jev_answers:
+            for dim, noul in jev_answers.items():
+                if dim == "OVERALL_PRODUCTION_GRADE" or noul >= 0.8:
+                    continue
+                items.append({"priority": "SHOULD FIX" if noul < 0.5 else "WORTH DOING",
+                              "area": "judgment", "id": dim,
+                              "title": f"{dim} scored weak (Jev noul {noul:.2f})",
+                              "evidence": "", "why": "judgment dimension below production bar",
+                              "fix": JEV_FIX.get(dim, "")})
+        # optional gaps worth knowing about, never scored
+        for c in self.checks:
+            if c["status"] == INFO and c["evidence"].startswith("none"):
+                items.append({"priority": "OPTIONAL", "area": sec_names.get(c["section"], str(c["section"])),
+                              "id": c["id"], "title": c["title"], "evidence": c["evidence"], "why": "",
+                              "fix": REMEDIATION.get(c["id"], ("", "consider adding"))[1]})
+        order = {"MUST FIX": 0, "SHOULD FIX": 1, "WORTH DOING": 2, "NOT AUDITED": 3, "OPTIONAL": 4}
+        return sorted(items, key=lambda i: order[i["priority"]])
+
+    def strengths(self):
+        good = [c["title"] for c in self.checks
+                if c["status"] == PASS and (c["gate"] or c["section"] in (2, 3, "A"))][:6]
+        return good
+
 
 SEO_MODULE = [("TITLE", "Page title present"), ("META_DESCRIPTION", "Meta description present"),
               ("SOCIAL_PREVIEW", "Open Graph + twitter card"), ("FAVICON", "Favicon loads"),
@@ -940,10 +1082,10 @@ def scan_secrets(build_dir):
     return hits
 
 
-def call_jev(state, api_key):
+def call_jev(state, api_key, questions):
     payload = {"model": MODEL, "state": state,
                "questions": {k: {"type": "noul", "instructions": q["instructions"], "criteria": q["criteria"]}
-                             for k, q in JEV_QUESTIONS.items()}}
+                             for k, q in questions.items()}}
     body = json.dumps(payload).encode()
     last = None
     for attempt in range(3):
@@ -998,7 +1140,12 @@ def main():
         else:
             try:
                 state = aud.evidence_text()[:MAX_STATE_CHARS]
-                resp = call_jev(state, key)
+                # only ask about TODOs when the repo module actually gathered evidence —
+                # Jev judging absence guesses conservatively and scores unfair weaks
+                has_repo_evidence = bool(getattr(aud, "todo_samples", None) or getattr(aud, "spec_open", None))
+                questions = {k: q for k, q in JEV_QUESTIONS.items()
+                             if k != "TODO_BLOCKING" or has_repo_evidence}
+                resp = call_jev(state, key, questions)
                 tokens = resp.get("usage", {}).get("input_tokens", 0)
                 answers = {k: v["noul"] for k, v in resp.get("answers", {}).items()}
                 missing = [k for k in JEV_QUESTIONS if k not in answers]
@@ -1015,6 +1162,8 @@ def main():
     result["jev_note"] = jev_note
     result["input_tokens"] = tokens
     result["checks"] = aud.checks
+    result["improvements"] = aud.improvements(answers)
+    result["strengths"] = aud.strengths()
 
     if args.json:
         print(json.dumps(result, indent=2))
@@ -1046,6 +1195,30 @@ def main():
             print(f"note       : {jev_note}")
         print("(* = hard gate; PASS=1.0 WARN=0.5 FAIL=0 within non-gate checks; "
               "final = 0.5*mech + 0.35*semantic + 0.15*agentic; skipped modules don't count against you)")
+
+        impr = result["improvements"]
+        if impr:
+            print("\n== IMPROVEMENT PLAN (what to do about it) ==")
+            cur = None
+            for it in impr:
+                if it["priority"] != cur:
+                    cur = it["priority"]
+                    hint = {"MUST FIX": "blocks launch", "SHOULD FIX": "costs the score",
+                            "WORTH DOING": "half credit, cheap wins", "NOT AUDITED": "rerun to cover",
+                            "OPTIONAL": "never scored, keep on radar"}[cur]
+                    print(f"\n-- {cur} ({hint}) --")
+                loc = f"[{it['area']}] " if it["area"] else ""
+                print(f"  * {loc}{it['title']}")
+                if it["evidence"]:
+                    print(f"      saw: {it['evidence']}")
+                if it["why"]:
+                    print(f"      why: {it['why']}")
+                if it["fix"]:
+                    print(f"      fix: {it['fix']}")
+        else:
+            print("\n== IMPROVEMENT PLAN ==\n  nothing to improve — every applicable check passed clean.")
+        if result["strengths"]:
+            print("\nsolid already: " + "; ".join(result["strengths"]))
 
     gates_failed = bool(result["gate_fails"])
     if gates_failed:
