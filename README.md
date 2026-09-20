@@ -1,5 +1,7 @@
 # ship-checklist
 
+![License](https://img.shields.io/github/license/0xm0w/ship-checklist) ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen) ![release](https://img.shields.io/github/v/tag/0xm0w/ship-checklist)
+
 **The final check pass before any web app goes live.** A scored production-readiness audit — mechanical checks in code, judgment calls scored by [TypeSafe Jev](https://docs.typesafe.ai), and an is-agentic measurement — ending in one verdict:
 
 ```
@@ -28,6 +30,35 @@ python scripts/ship_audit.py --url https://yoursite.com --json
 ```
 
 Exit codes: `0` production grade · `1` not production grade · `2` blocked (site-killer gate failed) · `3` error. Stdlib-only Python 3.10+ — no dependencies to install.
+
+## What a report looks like
+
+```
+== SCORE (posture: grade) ==
+mechanical : 82.1%
+semantic   : 47.2  (jev-latest, 3225 in-tokens)
+agentic    : 90.5%
+FINAL      : 71.2/100
+VERDICT    : NOT PRODUCTION GRADE
+
+== IMPROVEMENT PLAN (what to do about it) ==
+-- SHOULD FIX (costs the score) --
+  * [quality] Links resolve (45 internal, 7 external checked)
+      saw: https://github.com/moww20/purrbook -> 404
+      why: dead links burn trust and crawl budget
+      fix: fix or remove the listed URLs
+  * [judgment] TRUST_LEGAL scored weak (Jev noul 0.26)
+      why: judgment dimension below production bar
+      fix: publish/complete privacy + terms naming collected data and third parties
+-- WORTH DOING (half credit, cheap wins) --
+  * [share+SEO] sitemap.xml present and parseable
+      saw: missing or unparseable
+      fix: emit sitemap.xml with canonical prod URLs; submit in Search Console
+  ...
+solid already: Site reachable over HTTPS; HTTP forced to HTTPS; ...
+```
+
+(A real run against a real shipped site — the tool found its own author's dead link.)
 
 ## What it checks
 
