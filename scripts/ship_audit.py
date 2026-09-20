@@ -397,6 +397,8 @@ class Auditor:
             self.run_docs(args)
         if "agentic" in skip:
             self.skip_module("A", "agentic", AGENTIC_MODULE)
+        else:
+            self.run_agentic(page)
 
         self.check(1, "OPS_HIDDEN", "Items a URL scan cannot verify (answer in the report)", INFO,
                    "error monitoring wired; uptime signal; rollback tested; DB backups if DB-backed; "
@@ -454,6 +456,7 @@ class Auditor:
                    f"{alt} -> {ast}" + ("" if ast in (301, 308, 302, 307) else " (serves independently — canonicalization gap)"))
 
         robots_txt = self.text(self.base + "/robots.txt")
+        self.robots_txt = robots_txt
         sm_txt = self.text(self.base + "/sitemap.xml")
         self.sitemap_urls = parse_sitemap(sm_txt) if sm_txt else []
         self.check(2, "SITEMAP", "sitemap.xml present and parseable",
@@ -518,6 +521,30 @@ class Auditor:
                    f"Links resolve ({n_int} internal, {ext_checked} external checked)",
                    FAIL if all_broken else PASS,
                    "; ".join(all_broken[:8]) if all_broken else "no broken links")
+
+    def run_agentic(self, page):
+        self.check("A", "REAL_LINKS", "Navigation uses real href anchors (not onclick-only)",
+                   WARN if page.js_links else PASS,
+                   f"{len(page.js_links)} script-only links" if page.js_links else "all anchors carry href")
+        self.check("A", "FORM_LABELS", "Form inputs have accessible labels",
+                   WARN if page.unlabeled_inputs else PASS,
+                   f"unlabeled: {page.unlabeled_inputs}" if page.unlabeled_inputs else "all inputs labeled")
+        self.check("A", "TEXTLESS_CONTROLS", "Buttons/links have accessible text",
+                   WARN if page.textless else PASS,
+                   f"{len(page.textless)} textless controls" if page.textless else "all controls named")
+        self.check("A", "H1", "Exactly one h1 on the landing page",
+                   PASS if len(page.h1s) == 1 else WARN, f"{len(page.h1s)} h1 element(s)")
+        self.check("A", "STRUCTURE", "Heading structure present (h1-h3)",
+                   PASS if page.headings >= 3 else WARN, f"{page.headings} heading(s) on landing")
+        self.check("A", "JSON_LD", "Structured data (JSON-LD) present", INFO,
+                   f"{page.json_ld} block(s)" if page.json_ld else "none (recommended)")
+        robots_txt = getattr(self, "robots_txt", None)
+        ai_denies, ai_allows = parse_ai_bots(robots_txt or "")
+        self.check("A", "AI_CRAWLERS", "AI crawler policy in robots.txt (report, deliberate choice)", INFO,
+                   f"allows: {', '.join(ai_allows) or '-'} | denies: {', '.join(ai_denies) or '-'}")
+        llms = self.text(self.base + "/.well-known/llms.txt") or self.text(self.base + "/llms.txt")
+        self.check("A", "LLMS_TXT", "llms.txt agent manifest", INFO,
+                   "present" if llms else "none (optional, increasingly standard)")
 
     def run_oauth(self):
         if self.oauth_providers:
@@ -1148,7 +1175,7 @@ def main():
                 resp = call_jev(state, key, questions)
                 tokens = resp.get("usage", {}).get("input_tokens", 0)
                 answers = {k: v["noul"] for k, v in resp.get("answers", {}).items()}
-                missing = [k for k in JEV_QUESTIONS if k not in answers]
+                missing = [k for k in questions if k not in answers]
                 if missing:
                     jev_note = f"Jev did not return: {', '.join(missing)}"
                     for k in missing:
