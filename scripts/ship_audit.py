@@ -1,1259 +1,1413 @@
 #!/usr/bin/env python3
-"""ship-audit: mechanical production-readiness audit + optional Jev scoring pass.
-
-Usage:
-  python ship_audit.py --url https://example.com
-  python ship_audit.py --url https://example.com --build-dir dist/
-  python ship_audit.py --url https://example.com --repo /path/to/repo        # + repo/GitHub checks
-  python ship_audit.py --url https://example.com --docs https://docs.example # + docs stub-crawl
-  python ship_audit.py --url https://example.com --skip seo,agentic
-  python ship_audit.py --url https://example.com --posture fast              # gates decide, rest = notes
-  python ship_audit.py --url https://example.com --no-jev                    # mechanical only
-  python ship_audit.py --url https://example.com --json                      # machine-readable
-
-Modules: gates+quality always run; seo / agentic / repo(incl. GitHub via `gh`)
-/ docs / oauth run by default and can be skipped. Skipped checks are excluded
-from the score, not counted against it — checklists are a decision tree, not
-a flat list.
-
-Mechanical checks run in code (arithmetic belongs in code, never in a model).
-The evidence bundle is then scored by TypeSafe Jev for judgment-only dimensions
-(copy clarity, CTA focus, trust, agentic operability, TODO severity, overall
-production grade). Jev never counts: the script counts, Jev judges quality.
-Without TYPESAFE_API_KEY the audit degrades gracefully to mechanical-only.
-
-Exit codes: 0 production grade, 1 not production grade,
-2 blocked (site-killer gate failed), 3 error.
-"""
+"""Mechanical ship auditor. Arithmetic lives here; Jev only judges quality."""
+from __future__ import annotations
 
 import argparse
 import json
 import os
-import random
 import re
-import string
+import ssl
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse
+from pathlib import Path
+from typing import Any
 
-API_URL = "https://api.typesafe.ai/v1/systemone"
-MODEL = "jev-latest"
-MAX_STATE_CHARS = 100_000
-UA = "ship-audit/1.0 (production-readiness checklist)"
+UA = "ship-checklist-auditor/1.0 (+https://local.skill)"
+TIMEOUT = 12
+MAX_JEV_STATE = 100_000
+MAX_INTERNAL_LINKS = 30
+MAX_BODY = 400_000
 
-SECRETS_RE = re.compile(
-    r"(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{36}|gho_[A-Za-z0-9]{36}|"
-    r"AIza[A-Za-z0-9_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|"
-    r"AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
+SECRET_PATTERNS = [
+    ("stripe_live", re.compile(r"sk_live_[0-9a-zA-Z]{16,}")),
+    ("stripe_secret", re.compile(r"rk_live_[0-9a-zA-Z]{16,}")),
+    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("github_pat", re.compile(r"ghp_[0-9A-Za-z]{20,}")),
+    ("github_fine_grained", re.compile(r"github_pat_[0-9A-Za-z_]{20,}")),
+    ("slack_token", re.compile(r"xox[baprs]-[0-9A-Za-z-]{10,}")),
+    ("google_api", re.compile(r"AIza[0-9A-Za-z\-_]{20,}")),
+    ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
+    ("openai", re.compile(r"sk-(?:proj-)?[0-9A-Za-z]{20,}")),
+    ("supabase_service", re.compile(r"service_role['\"]?\s*[:=]\s*['\"]eyJ")),
+    ("jwt_service", re.compile(r"eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}")),
+]
+
+PUBLIC_PREFIX_OK = re.compile(r"(NEXT_PUBLIC_|VITE_|PUBLIC_|REACT_APP_)")
+STUB_MARKERS = re.compile(
+    r"coming soon|under construction|work in progress|lorem ipsum|todo:\s*write|placeholder copy",
+    re.I,
 )
-PROTECTION_MARKERS = ("sso", "vercel", "netlify", "cloudflareaccess", "cloudflare_access")
-AI_BOTS = ("GPTBot", "ClaudeBot", "Claude-Web", "anthropic-ai", "PerplexityBot",
-           "Google-Extended", "CCBot", "Bytespider", "meta-externalagent")
-TODO_RE = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b")
-STUB_RE = re.compile(r"coming soon|under construction|work in progress|not yet (available|written)|lorem ipsum", re.I)
-OAUTH_SIGNATURES = {
-    "Google": "accounts.google.com/o/oauth",
-    "GitHub": "github.com/login/oauth",
-    "X/Twitter": "twitter.com/i/oauth",
-    "Apple": "appleid.apple.com",
-    "Microsoft": "login.microsoftonline.com",
-    "Discord": "discord.com/oauth",
-    "Auth0": "auth0.com",
-    "Clerk": "clerk.",
-    "Supabase": "supabase",
-    "thirdweb": "thirdweb",
+TODO_RE = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b[:\s].{0,80}")
+USER_FACING_TODO = re.compile(
+    r"\b(TODO|FIXME|XXX|HACK)\b.*\b(login|signup|pay|checkout|page|ui|user|auth|broken|implement|unfinished|ship)\b",
+    re.I,
+)
+SPEC_BOX = re.compile(r"^\s*[-*]\s*\[\s*\]\s+", re.M)
+ENV_FILE_NAMES = {".env", ".env.local", ".env.production", ".env.development"}
+SKIP_DIR_NAMES = {
+    ".git", "node_modules", "vendor", "dist", "build", ".next", "coverage",
+    "__pycache__", ".venv", "venv", "minified",
 }
-SPEC_FILES = ("TODO.md", "SPEC.md", "ROADMAP.md", "BACKLOG.md", "NOTES.md")
+PROTECTION_HINTS = (
+    "vercel.com/login",
+    "sso.vercel",
+    "vercel_sso",
+    "cloudflareaccess.com",
+    "cdn-cgi/access",
+    "netlify.app/.netlify/identity",
+    "access.redhat.com",  # harmless-ish; kept out of primary list via startswith checks below
+)
+PRIMARY_PROTECTION = (
+    "vercel.com/login",
+    "sso.vercel",
+    "cloudflareaccess.com",
+    "cdn-cgi/access",
+)
 
-PASS, WARN, FAIL, INFO, NA = "PASS", "WARN", "FAIL", "INFO", "N/A"
-
-
-def hget(headers, name):
-    """Case-insensitive header lookup (headers arrive as an email Message)."""
-    for k in headers:
-        if k.lower() == name.lower():
-            return headers[k]
-    return ""
-
-
-def run_cmd(argv, cwd=None, timeout=20):
-    """Run a command, return (ok, stdout+stderr text). Never raises."""
-    try:
-        p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
-        return p.returncode == 0, (p.stdout or "") + (p.stderr or "")
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return False, str(e)
-
-
-# Judgment-only dimensions. High noul = production grade on that dimension.
-# Criteria are literal; boundary cases spelled out; absence is handled in "true".
 JEV_QUESTIONS = {
     "COPY_CLARITY": {
-        "instructions": "Judging the supplied page evidence: are the titles, headings, and body copy specific, human, and free of placeholder or stub content?",
+        "type": "noul",
+        "instructions": "Is the shipped copy clear enough that a first-time visitor can say what this page is for in one sentence?",
         "criteria": {
-            "true": "Copy names the actual product/purpose, reads like it was written for this page, and contains no lorem ipsum, TODO markers, template placeholders, or obviously unfinished sections",
-            "false": "Copy is placeholder/stub, generic template text, or self-contradictory about what the product is",
+            "true": "Purpose is explicit in the first screen of copy. No lorem, no internal jargon as the only explanation, no contradictory headlines.",
+            "false": "Headline is vague, placeholder, or the page does not state what the product or site is.",
         },
     },
     "CTA_FOCUS": {
-        "instructions": "Judging the homepage evidence: is there exactly one obvious primary action, with secondary paths visually quieter?",
+        "type": "noul",
+        "instructions": "Does the page present one primary action a visitor can take?",
         "criteria": {
-            "true": "One clear primary call-to-action dominates the page; secondary links exist but do not compete for the same visual weight",
-            "false": "No clear next step, or five equally-loud competing actions, or the only actions are navigation with no conversion path",
+            "true": "A single primary CTA is visually and verbally dominant. Secondary actions exist but do not compete equally.",
+            "false": "No CTA, many equal CTAs, or the main action is hidden in a nav-only control.",
         },
     },
     "META_QUALITY": {
-        "instructions": "Judging the supplied titles and meta descriptions across pages: are they real, specific summaries of their pages?",
+        "type": "noul",
+        "instructions": "Are title, description, and social tags specific to this page rather than a site-wide stub?",
         "criteria": {
-            "true": "Each description summarizes that page's actual content in a sentence a human would write; titles distinguish pages from each other",
-            "false": "Descriptions are missing, duplicated across pages, keyword-stuffed, or describe nothing on the page",
+            "true": "Title and description name the product and page purpose. OG tags match the page.",
+            "false": "Generic 'Home', framework defaults, missing description, or OG that contradicts the page.",
         },
     },
     "TRUST_LEGAL": {
-        "instructions": "Judging the supplied privacy-policy and terms text (or its absence): do the legal pages cover the basics a visitor would need?",
+        "type": "noul",
+        "instructions": "Does the site look trustworthy enough to hand personal data or money, given the launch type?",
         "criteria": {
-            "true": "Policy names what data is collected and why, covers third parties (analytics/auth), and reads complete for this site's scope — or the site collects nothing needing a policy",
-            "false": "Policy is lorem/placeholder, contradicts visible behavior (e.g. denies cookies that are set), missing entirely while analytics and auth are visibly present",
-        },
-    },
-    "AGENTIC_OPERABILITY": {
-        "instructions": "Judging the supplied structural evidence: could an autonomous browser agent (no vision, DOM and accessibility tree only) discover the site's purpose and complete its primary task?",
-        "criteria": {
-            "true": "Navigation uses real href links with descriptive text, forms have labeled inputs, headings describe structure, and the primary action is reachable from the homepage DOM",
-            "false": "Primary actions are onclick-only or textless controls, inputs lack labels, structure is unreadable from DOM semantics, or content requires hover/vision-only affordances",
+            "true": "Privacy/terms reachable when personal data is collected; no obvious scam or unfinished-legal feel.",
+            "false": "Auth or payments with no legal pages, or legal pages that are stubs.",
         },
     },
     "TODO_BLOCKING": {
-        "instructions": "Judging the sampled TODO/FIXME markers and open spec items from the repository: does any of them mark functionality that is unfinished, stubbed, or known-broken for a launched user?",
+        "type": "noul",
+        "instructions": "Do sampled TODO/FIXME comments mark unfinished user-facing functionality?",
         "criteria": {
-            "true": "No markers are present, or every sampled one is a chore note, future idea, or internal refactor wish that cannot affect what a launched user sees or does",
-            "false": "A marker or open spec item corresponds to unfinished user-facing functionality, a stubbed feature, or a known broken thing in what ships",
+            "true": "Yes — comments describe missing pages, auth, payments, or broken UI that a user would hit.",
+            "false": "No — comments are chores, refactors, or test notes a user would never see.",
         },
     },
-    "OVERALL_PRODUCTION_GRADE": {
-        "instructions": "Taking the supplied mechanical audit results together with the evidence: is this site production grade for a public launch? Mechanical failures listed in the report are decisive for their dimension — do not excuse a listed failure because the surrounding evidence looks good.",
+    "AGENTIC_OPERABILITY": {
+        "type": "noul",
+        "instructions": "Could an autonomous browser agent using only the DOM and accessibility tree discover the purpose and complete the primary task?",
         "criteria": {
-            "true": "No mechanical gate is failed and, in your judgment, a real user could complete the site's purpose today without embarrassment or breakage",
-            "false": "A gate is failed, or the judgment dimensions (copy, CTA, trust, agentic, todos) are collectively below what a paying public would accept",
+            "true": "Real links, labeled inputs, a real heading structure, and the primary task is exposed as a normal control.",
+            "false": "onclick-only navigation, unlabeled fields, no h1, or the primary task is hidden behind hover or canvas.",
         },
     },
 }
 
 
-# Remediation knowledge: check id -> (why it matters, how to fix).
-# The score says how bad; this says what to do about it.
-REMEDIATION = {
-    "SECRETS": ("anything in the client build is public to the world",
-                "rotate every flagged key NOW (removal is not rotation), move it server-side, re-scan"),
-    "ENV_IN_HISTORY": ("a committed .env leaks every value it ever held",
-                       "rotate all values in that file, then purge with git filter-repo or accept if rotated"),
-    "ACCESS_PROTECTION": ("everyone except the logged-in owner sees a login page — the site looks dead",
-                          "disable deploy protection in host settings; Vercel: PATCH v9/projects {\"ssoProtection\": null}"),
-    "HTTPS_REDIRECT": ("plain HTTP still serves — strip works, cookies can leak",
-                       "enable force-HTTPS in host settings or add a 301 redirect rule"),
-    "MIXED_CONTENT": ("browsers warn or block plain-HTTP subresources on an HTTPS page",
-                      "switch the listed resources to https:// or bundle them locally"),
-    "SITE_UP": ("the site is unreachable", "fix hosting/DNS first — nothing else can be judged"),
-    "SECURITY_HEADERS": ("missing headers leave clickjacking/MIME-sniffing/referrer leaks open",
-                         "add HSTS, X-Content-Type-Options, frame-ancestors/X-Frame-Options, Referrer-Policy, Permissions-Policy via host config (vercel.json headers, _headers, nginx)"),
-    "COOKIE_FLAGS": ("cookies without Secure/HttpOnly are stealable or injectable",
-                     "set Secure + HttpOnly (+ SameSite) on every cookie the app issues"),
-    "OPS_HIDDEN": ("these fail silently and no scan can see them",
-                   "answer each with the owner + evidence before launch"),
-    "TITLE": ("browser tabs, bookmarks and SERPs show nothing useful",
-              "add a <title> naming the product and page purpose"),
-    "META_DESCRIPTION": ("search engines improvise your snippet without it",
-                         "add a 50-160 char meta description summarizing the page"),
-    "SOCIAL_PREVIEW": ("shares render as a bare link with no card",
-                       "add og:title, og:image 1200x630, twitter:card; verify at opengraph.xyz"),
-    "FAVICON": ("missing favicon reads as unfinished in tabs and bookmarks",
-                "add favicon.ico + apple-touch-icon and confirm both return 200"),
-    "CANONICAL_TAG": ("duplicate-content ambiguity across URL variants",
-                      "add <link rel=canonical> pointing at the preferred URL"),
-    "CANONICAL_HOST": ("apex and www serve independently — SEO splits between them",
-                       "301 one host to the other and canonicalize"),
-    "SITEMAP": ("crawlers discover pages slowly or not at all",
-                "emit sitemap.xml with canonical prod URLs; submit in Search Console"),
-    "ROBOTS": ("no robots.txt means no control over crawling or a place for the sitemap ref",
-               "serve robots.txt (block /api, staging; reference the sitemap)"),
-    "UNIQUE_TITLES": ("duplicate titles collapse pages in SERP and history",
-                      "give each page a distinct title/description"),
-    "LANG": ("screen readers and agents guess the language wrong",
-             "set <html lang>"),
-    "NOT_FOUND": ("bad links land on the homepage pretending to be real (200) — users and crawlers are misled",
-                  "add a branded 404 that returns a real 404 status (Next: not-found.tsx; static hosts: 404.html + correct fallback config)"),
-    "IMG_ALT": ("images are invisible to screen readers and agents",
-                "add descriptive alt attributes (empty alt only for decoration)"),
-    "BROKEN_LINKS": ("dead links burn trust and crawl budget",
-                     "fix or remove the listed URLs"),
-    "VIEWPORT": ("without a viewport meta, mobile renders zoomed-out desktop",
-                 "add <meta name=viewport content=\"width=device-width, initial-scale=1\">"),
-    "REAL_LINKS": ("agents and crawlers can't follow onclick-only navigation",
-                   "use real <a href> for navigation; keep JS handlers as enhancement"),
-    "FORM_LABELS": ("unlabeled inputs are unusable by screen readers and agents",
-                    "add <label for>, aria-label, or wrap inputs in labels"),
-    "TEXTLESS_CONTROLS": ("icon-only buttons with no accessible name are invisible to agents",
-                          "add aria-label or visible text to every control"),
-    "H1": ("the page has no dominant heading — structure is unclear to crawlers and readers",
-           "one h1 per page stating what the page is"),
-    "STRUCTURE": ("flat heading structure hides the content outline",
-                  "use h1-h3 hierarchically"),
-    "CLEAN_TREE": ("uncommitted work can ship (CLI deploys the working tree) or get lost",
-                   "commit or stash; re-run git status until clean"),
-    "SHIPPED": ("unpushed commits mean the repo doesn't match reality; unpulled means you're not testing what's deployed",
-                "git push (and pull) until ahead=0 behind=0"),
-    "BRANCHES": ("merged branches pile up and hide the real work",
-                 "git branch -d <name> for each listed branch"),
-    "WORKTREES": ("dead worktree entries rot the repo state",
-                  "git worktree prune"),
-    "TODO_SCAN": ("TODOs marking unfinished user-facing work ship broken promises",
-                  "close them or ticket them with an owner; Jev's TODO_BLOCKING noul says how bad these samples are"),
-    "SPECS": ("open spec items are decisions not yet made",
-              "decide per item: ship without it (move to backlog) or finish it"),
-    "README": ("a repo without a real README reads as abandoned",
-               "write what/why/how-to-run; no placeholders"),
-    "LICENSE": ("public code without a license is legally unusable by others",
-                "add MIT/Apache-2.0 at repo root"),
-    "GITHUB_META": ("empty About wastes the repo's landing page",
-                    "gh repo edit --description ... --homepage <prod-url> --add-topic ..."),
-    "CI": ("a red latest run means main is broken",
-           "open the failing run, fix, re-merge"),
-    "DOCS": ("no docs at the expected place",
-             "add /docs or pass --docs URL if hosted elsewhere"),
-    "DOCS_STUBS": ("stub sections in shipped docs are worse than no docs",
-                   "write the missing sections or remove the pages"),
-    "OAUTH_PROVIDERS": ("OAuth is in play — its failure modes are silent and user-facing",
-                        "walk the OAuth deep-dive: exact prod redirect URIs, state/PKCE, secrets server-side, account linking decided, one full prod login"),
-}
-
-JEV_FIX = {
-    "COPY_CLARITY": "rewrite titles/headings/copy to name the actual product; remove placeholder text",
-    "CTA_FOCUS": "pick one primary action per page; demote secondary links visually",
-    "META_QUALITY": "write unique, specific meta descriptions per page (50-160 chars)",
-    "TRUST_LEGAL": "publish/complete privacy + terms naming collected data and third parties",
-    "AGENTIC_OPERABILITY": "fix DOM semantics: real hrefs, labeled inputs, named controls, heading structure",
-    "TODO_BLOCKING": "close or ticket the TODOs marking unfinished user-facing work before launch",
-}
-
-
-class Auditor:
-    def __init__(self, base_url, timeout):
-        self.base = base_url.rstrip("/")
-        self.host = urlparse(base_url).netloc
-        self.timeout = timeout
-        self.checks = []
-        self.pages = {}          # url -> PageInfo
-        self.redirect_chain = []
-        self.oauth_providers = []
-
-    # ---- fetching ----
-    def fetch(self, url, method="GET"):
-        self.redirect_chain = []
-        req = urllib.request.Request(url, headers={"User-Agent": UA}, method=method)
-        opener = urllib.request.build_opener(_RecordingRedirect(self))
-        try:
-            with opener.open(req, timeout=self.timeout) as resp:
-                body = resp.read()
-                return resp.status, dict(resp.headers), body, self.redirect_chain[:]
-        except urllib.error.HTTPError as e:
-            return e.code, dict(e.headers or {}), (e.read() or b""), self.redirect_chain[:]
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            return None, {}, b"", str(e)
-
-    def text(self, url):
-        status, headers, body, extra = self.fetch(url)
-        if status is None or status >= 400:
-            return None
-        return body.decode("utf-8", errors="replace")
-
-    def check(self, section, cid, title, status, evidence="", gate=False):
-        self.checks.append({"section": section, "id": cid, "title": title,
-                            "status": status, "evidence": evidence, "gate": gate})
-
-    def skip_module(self, section, name, modlist):
-        for cid, title in modlist:
-            self.check(section, cid, title, NA, f"skipped (--skip {name})")
-
-    # ---- URL audit ----
-    def run(self, args):
-        skip = {s.strip() for s in (args.skip or "").split(",") if s.strip()}
-        root_status, root_headers, root_body, extra = self.fetch(self.base)
-        if root_status is None:
-            self.check(0, "SITE_UP", "Site reachable over HTTPS", FAIL,
-                       f"could not fetch {self.base}: {extra}", gate=True)
-            self.finish_modules(skip, args, crawled=False)
-            return
-        html = root_body.decode("utf-8", errors="replace")
-        page = parse_html(html)
-        self.pages[self.base] = page
-        root_chain = extra if isinstance(extra, list) else []
-
-        # 0 -- site-killers (gates)
-        self.check(0, "SITE_UP", "Site reachable over HTTPS", PASS,
-                   f"GET {self.base} -> {root_status}", gate=True)
-
-        st, hdrs, _, chain = self.fetch("http://" + self.host + "/")
-        loc = hget(hdrs, "Location")
-        # 308 is not auto-followed by urllib (<3.11 has no http_error_308); 301/302/307 are.
-        followed_to_https = st == 200 and any("https://" in c for c in chain)
-        if (st in (301, 302, 307, 308) and loc.lower().startswith("https://")) or followed_to_https:
-            self.check(0, "HTTPS_REDIRECT", "HTTP forced to HTTPS", PASS,
-                       f"{st} -> {loc}" if loc else " -> ".join(chain), gate=True)
-        else:
-            self.check(0, "HTTPS_REDIRECT", "HTTP forced to HTTPS", FAIL,
-                       f"http:// returned {st}" + (f", Location={loc}" if loc else " with no https redirect"),
-                       gate=True)
-
-        final = root_chain[-1] if root_chain else ""
-        if any(m in final.lower() for m in PROTECTION_MARKERS) and root_status in (301, 302, 303, 307, 308):
-            self.check(0, "ACCESS_PROTECTION", "Anonymous visitor reaches the site (no host access-protection gate)",
-                       FAIL, f"root redirected to {final} — deploy protection is on; "
-                             f"check logged out (Vercel fix: PATCH v9/projects {{\"ssoProtection\": null}})", gate=True)
-        else:
-            self.check(0, "ACCESS_PROTECTION", "Anonymous visitor reaches the site (no host access-protection gate)",
-                       PASS, f"root -> {root_status} anonymously", gate=True)
-
-        http_resources = [u for u in page.resources if u.startswith("http://")]
-        self.check(0, "MIXED_CONTENT", "No plain-HTTP subresources on the HTTPS page",
-                   FAIL if http_resources else PASS,
-                   ", ".join(http_resources[:5]) if http_resources else "all subresources are https", gate=True)
-
-        if args.build_dir:
-            leaks = scan_secrets(args.build_dir)
-            self.check(0, "SECRETS", "No credential patterns in the client build",
-                       FAIL if leaks else PASS,
-                       "; ".join(f"{p}: {', '.join(files[:3])}" for p, files in leaks.items()) if leaks
-                       else f"scanned {args.build_dir}, no key patterns found", gate=True)
-        else:
-            self.check(0, "SECRETS", "No credential patterns in the client build", NA,
-                       "pass --build-dir to scan the built output")
-
-        # 1 -- trust headers (part of core, cheap)
-        missing_hdr = [h for h, present in (
-            ("Strict-Transport-Security", "strict-transport-security" in {k.lower() for k in root_headers}),
-            ("X-Content-Type-Options", "x-content-type-options" in {k.lower() for k in root_headers}),
-            ("X-Frame-Options/CSP frame-ancestors", any(k.lower() in ("x-frame-options", "content-security-policy") for k in root_headers)),
-            ("Referrer-Policy", "referrer-policy" in {k.lower() for k in root_headers}),
-            ("Permissions-Policy", "permissions-policy" in {k.lower() for k in root_headers}),
-        ) if not present]
-        self.check(1, "SECURITY_HEADERS", "Security headers present",
-                   WARN if missing_hdr else PASS,
-                   "missing: " + ", ".join(missing_hdr) if missing_hdr else "HSTS + XCTO + framing + referrer + permissions all present")
-
-        cookies = [v for k, v in root_headers.items() if k.lower() == "set-cookie"]
-        bad_flags = [c.split("=")[0] for c in cookies
-                     if not (re.search(r";\s*secure", c, re.I) and re.search(r";\s*httponly", c, re.I))]
-        self.check(1, "COOKIE_FLAGS", "Cookies set Secure+HttpOnly", WARN if bad_flags else PASS,
-                   "missing flags on: " + ", ".join(bad_flags) if bad_flags
-                   else ("no cookies on landing" if not cookies else "all cookies flagged"))
-
-        self.detect_oauth(html)
-
-        if "seo" in skip:
-            self.skip_module(2, "seo", SEO_MODULE)
-            self.check(2, "UNIQUE_TITLES", "Titles unique across pages", NA, "skipped (--skip seo)")
-            self.check(2, "LANG", "html lang attribute set", NA, "skipped (--skip seo)")
-            self.check(3, "VIEWPORT", "Mobile viewport meta present", NA, "skipped (--skip seo)")
-        else:
-            self.run_seo(page, root_headers)
-        if "quality" in skip:
-            self.skip_module(3, "quality", QUALITY_MODULE)
-        else:
-            self.run_quality(args, page)
-
-        # crawl
-        urls = [u for u in self.sitemap_urls if u.startswith("http")][:args.pages]
-        if self.base not in urls:
-            urls = [self.base] + urls
-        for u in urls:
-            if u in self.pages:
-                continue
-            s, _, b, _ = self.fetch(u)
-            if s and s < 400 and b:
-                self.pages[u] = parse_html(b.decode("utf-8", errors="replace"))
-
-        if "quality" not in skip:
-            imgs_total = sum(len(p.imgs) for p in self.pages.values())
-            imgs_noalt = sum(1 for p in self.pages.values() for alt in p.imgs if alt is None)
-            self.check(3, "IMG_ALT", "Images carry alt attributes (missing attribute, not empty=decorative)",
-                       WARN if imgs_noalt else (PASS if imgs_total else INFO),
-                       f"{imgs_noalt} of {imgs_total} images missing alt")
-            self.run_link_checks(skip)
-
-        if "oauth" not in skip:
-            self.run_oauth()
-        if "repo" not in skip and args.repo:
-            self.run_repo(args.repo)
-        elif "repo" not in skip:
-            self.check("R", "REPO", "Repository readiness (git hygiene, TODOs, README, GitHub)", NA,
-                       "pass --repo /path/to/repo to include")
-        if "docs" not in skip:
-            self.run_docs(args)
-        if "agentic" in skip:
-            self.skip_module("A", "agentic", AGENTIC_MODULE)
-        else:
-            self.run_agentic(page)
-
-        self.check(1, "OPS_HIDDEN", "Items a URL scan cannot verify (answer in the report)", INFO,
-                   "error monitoring wired; uptime signal; rollback tested; DB backups if DB-backed; "
-                   "email sending verified end-to-end with SPF/DKIM/DMARC; dependency audit (npm audit); "
-                   "2FA on host/registrar; admin routes unindexed; API authz + rate limiting"
-                   + ("; OAuth: prod redirect URIs exact, state/PKCE enforced, secrets server-side, "
-                      "account linking decided, one full prod login tested" if self.oauth_providers else ""))
-
-    def detect_oauth(self, html):
-        found = set()
-        for provider, sig in OAUTH_SIGNATURES.items():
-            if sig in html:
-                found.add(provider)
-        for t in self.pages[self.base].button_texts + self.pages[self.base].anchor_texts:
-            lt = t.lower().strip()
-            for provider in OAUTH_SIGNATURES:
-                if lt.startswith(("sign in with", "continue with", "login with")) and provider.lower() in lt:
-                    found.add(provider)
-        self.oauth_providers = sorted(found)
-
-    def run_seo(self, page, root_headers):
-        self.check(2, "TITLE", "Page title present", PASS if page.title else WARN, page.title or "no <title>")
-        desc = page.meta.get("description", "")
-        self.check(2, "META_DESCRIPTION", "Meta description present", PASS if desc else WARN,
-                   (desc[:120] + ("..." if len(desc) > 120 else "")) if desc else "missing")
-
-        problems = [t for t in ("og:title", "og:image", "twitter:card") if t not in page.meta]
-        og_img = page.meta.get("og:image", "")
-        og_ev = f"og:image={og_img}" if og_img else "no og:image"
-        if og_img:
-            s, h, _, _ = self.fetch(og_img, method="HEAD")
-            ctype = hget(h, "Content-Type")
-            if s is None or s >= 400 or "image" not in ctype:
-                problems.append(f"og:image fetch -> {s} (broken preview image)")
-        self.check(2, "SOCIAL_PREVIEW", "Open Graph + twitter card tags with a live preview image",
-                   WARN if problems else PASS,
-                   "; ".join(problems) if problems else "og:title, og:image (live), twitter:card all present")
-
-        fav = next((urljoin(self.base, h) for rel, h in page.links if "icon" in rel), None)
-        fav_url = fav or urlparse(self.base).scheme + "://" + self.host + "/favicon.ico"
-        fs, _, _, _ = self.fetch(fav_url, method="HEAD")
-        if fs and fs >= 400:
-            fs2, _, _, _ = self.fetch(fav_url)
-            fs = fs2
-        self.check(2, "FAVICON", "Favicon loads", PASS if fs and fs < 400 else WARN, f"{fav_url} -> {fs}")
-
-        canon = next((urljoin(self.base, h) for rel, h in page.links if rel == "canonical"), None)
-        self.check(2, "CANONICAL_TAG", "Canonical tag on landing page", PASS if canon else WARN,
-                   canon or "no <link rel=canonical>")
-
-        alt = ("www." + self.host) if not self.host.startswith("www.") else self.host[4:]
-        ast, _, _, _ = self.fetch(urlparse(self.base).scheme + "://" + alt + "/", method="GET")
-        self.check(2, "CANONICAL_HOST", "One canonical host (apex/www redirect)",
-                   PASS if ast in (301, 308, 302, 307) else WARN,
-                   f"{alt} -> {ast}" + ("" if ast in (301, 308, 302, 307) else " (serves independently — canonicalization gap)"))
-
-        robots_txt = self.text(self.base + "/robots.txt")
-        self.robots_txt = robots_txt
-        sm_txt = self.text(self.base + "/sitemap.xml")
-        self.sitemap_urls = parse_sitemap(sm_txt) if sm_txt else []
-        self.check(2, "SITEMAP", "sitemap.xml present and parseable",
-                   PASS if self.sitemap_urls else WARN,
-                   f"{len(self.sitemap_urls)} urls" if self.sitemap_urls else "missing or unparseable")
-        self.check(2, "ROBOTS", "robots.txt present", PASS if robots_txt is not None else WARN,
-                   (robots_txt[:100] + "...") if robots_txt else "missing")
-
-        dup_titles = len(self.pages) - len({p.title for p in self.pages.values() if p.title})
-        if len(self.pages) < 2:
-            self.check(2, "UNIQUE_TITLES", "Titles unique across pages", NA,
-                       "single page crawled (no sitemap to extend the crawl)")
-        else:
-            self.check(2, "UNIQUE_TITLES", "Titles unique across pages",
-                       WARN if dup_titles else PASS, f"{dup_titles} duplicate title(s) across {len(self.pages)} pages")
-        self.check(2, "LANG", "html lang attribute set", PASS if page.lang else WARN, page.lang or "missing")
-
-    def run_quality(self, args, page):
-        probe = self.base + "/ship-audit-404-" + "".join(random.choices(string.hexdigits.lower(), k=8))
-        ps, _, pb, _ = self.fetch(probe)
-        if ps is not None and ps < 400:
-            t = parse_html(pb.decode("utf-8", errors="replace")).title
-            self.check(3, "NOT_FOUND", "Garbage deep link returns a 404 status",
-                       WARN, f"probe -> {ps} (SPA fallback serving HTML — no real 404) title={t!r}")
-        else:
-            self.check(3, "NOT_FOUND", "Garbage deep link returns a 404 status", PASS, f"probe -> {ps}")
-
-        self.check(3, "VIEWPORT", "Mobile viewport meta present",
-                   PASS if page.viewport else WARN, "viewport found" if page.viewport else "no viewport meta")
-
-    def run_link_checks(self, skip):
-        internal, external = {}, {}
-        for u, p in self.pages.items():
-            for href in p.anchors:
-                absu = urljoin(u, href.split("#")[0])
-                if not absu.startswith("http"):
-                    continue
-                if urlparse(absu).netloc == self.host:
-                    internal.setdefault(absu, True)
-                else:
-                    external.setdefault(absu, True)
-        broken = []
-        checked = [u for u in internal if u not in self.pages and "/ship-audit-404-" not in u][:150]
-        for u in checked:
-            s, _, _, _ = self.fetch(u, method="HEAD")
-            if s is None or s >= 400:
-                s2, _, _, _ = self.fetch(u)
-                if s2 is None or s2 >= 400:
-                    broken.append(f"{u} -> {s2 or s}")
-        n_int = len(checked) + len([u for u in internal if u in self.pages])
-        ext_broken, ext_checked = [], 0
-        if "seo" not in skip:
-            for u in list(external)[:40]:
-                ext_checked += 1
-                s, _, _, _ = self.fetch(u, method="HEAD")
-                if s is None or (s >= 400 and s not in (403, 405, 406, 429, 999)):
-                    s2, _, _, _ = self.fetch(u)
-                    if s2 is None or (s2 >= 400 and s2 not in (403, 405, 406, 429, 999)):
-                        ext_broken.append(f"{u} -> {s2 or s}")
-        all_broken = broken + ext_broken
-        self.check(3, "BROKEN_LINKS",
-                   f"Links resolve ({n_int} internal, {ext_checked} external checked)",
-                   FAIL if all_broken else PASS,
-                   "; ".join(all_broken[:8]) if all_broken else "no broken links")
-
-    def run_agentic(self, page):
-        self.check("A", "REAL_LINKS", "Navigation uses real href anchors (not onclick-only)",
-                   WARN if page.js_links else PASS,
-                   f"{len(page.js_links)} script-only links" if page.js_links else "all anchors carry href")
-        self.check("A", "FORM_LABELS", "Form inputs have accessible labels",
-                   WARN if page.unlabeled_inputs else PASS,
-                   f"unlabeled: {page.unlabeled_inputs}" if page.unlabeled_inputs else "all inputs labeled")
-        self.check("A", "TEXTLESS_CONTROLS", "Buttons/links have accessible text",
-                   WARN if page.textless else PASS,
-                   f"{len(page.textless)} textless controls" if page.textless else "all controls named")
-        self.check("A", "H1", "Exactly one h1 on the landing page",
-                   PASS if len(page.h1s) == 1 else WARN, f"{len(page.h1s)} h1 element(s)")
-        self.check("A", "STRUCTURE", "Heading structure present (h1-h3)",
-                   PASS if page.headings >= 3 else WARN, f"{page.headings} heading(s) on landing")
-        self.check("A", "JSON_LD", "Structured data (JSON-LD) present", INFO,
-                   f"{page.json_ld} block(s)" if page.json_ld else "none (recommended)")
-        robots_txt = getattr(self, "robots_txt", None)
-        ai_denies, ai_allows = parse_ai_bots(robots_txt or "")
-        self.check("A", "AI_CRAWLERS", "AI crawler policy in robots.txt (report, deliberate choice)", INFO,
-                   f"allows: {', '.join(ai_allows) or '-'} | denies: {', '.join(ai_denies) or '-'}")
-        llms = self.text(self.base + "/.well-known/llms.txt") or self.text(self.base + "/llms.txt")
-        self.check("A", "LLMS_TXT", "llms.txt agent manifest", INFO,
-                   "present" if llms else "none (optional, increasingly standard)")
-
-    def run_oauth(self):
-        if self.oauth_providers:
-            self.check("O", "OAUTH_PROVIDERS", "OAuth providers detected (flow below is then CORE, not optional)",
-                       INFO, ", ".join(self.oauth_providers))
-        else:
-            self.check("O", "OAUTH_PROVIDERS", "OAuth providers detected on landing page", INFO,
-                       "none visible — if the app has login, confirm provider config manually")
-        # the actionable OAuth items are interactive: redirect URIs, state/PKCE,
-        # server-side secrets, account linking, one full prod login. See SKILL.md.
-
-    def run_docs(self, args):
-        docs_base = args.docs or (self.base + "/docs")
-        s, _, b, _ = self.fetch(docs_base)
-        if s is None or s >= 400:
-            self.check("D", "DOCS", "Documentation present", NA,
-                       f"no docs at {docs_base} (pass --docs URL if hosted elsewhere — or genuinely none, fine)")
-            return
-        docs_pages, todo = {docs_base}, [docs_base]
-        stubs = []
-        while todo and len(docs_pages) < 12:
-            u = todo.pop()
-            txt = self.text(u)
-            if txt is None:
-                continue
-            if STUB_RE.search(txt):
-                stubs.append(u)
-            dp = parse_html(txt)
-            for href in dp.anchors:
-                absu = urljoin(u, href.split("#")[0])
-                if absu.startswith(docs_base) and absu not in docs_pages:
-                    docs_pages.add(absu)
-                    todo.append(absu)
-        self.check("D", "DOCS", f"Documentation present ({len(docs_pages)} page(s) crawled)",
-                   PASS, docs_base)
-        self.check("D", "DOCS_STUBS", "No stub/placeholder sections in docs",
-                   WARN if stubs else PASS,
-                   "; ".join(stubs[:5]) if stubs else "no stub markers found")
-
-    def run_repo(self, repo):
-        repo = os.path.abspath(repo)
-        ok, out = run_cmd(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo)
-        if not ok or out.strip() != "true":
-            self.check("R", "REPO", "Repository readiness", NA, f"{repo} is not a git work tree")
-            return
-
-        self.check("R", "REPO", "Repository readiness", PASS, repo)
-
-        _, por = run_cmd(["git", "status", "--porcelain"], cwd=repo)
-        dirty = [l for l in por.splitlines() if l.strip()]
-        self.check("R", "CLEAN_TREE", "Working tree clean (nothing uncommitted)",
-                   WARN if dirty else PASS,
-                   f"{len(dirty)} uncommitted file(s): {dirty[:5]}" if dirty else "clean")
-
-        _, branch = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo)
-        branch = branch.strip()
-        ok, cnt = run_cmd(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=repo)
-        ahead = int(cnt.strip()) if ok and cnt.strip().isdigit() else None
-        ok2, cnt2 = run_cmd(["git", "rev-list", "--count", "HEAD..@{u}"], cwd=repo)
-        behind = int(cnt2.strip()) if ok2 and cnt2.strip().isdigit() else None
-        if ahead is None:
-            self.check("R", "SHIPPED", f"All commits pushed (branch {branch})", WARN,
-                       "branch has no upstream — nothing to compare against")
-        else:
-            msg = f"{branch}: {ahead} unpushed, {behind or 0} unpulled"
-            self.check("R", "SHIPPED", "All commits shipped (pushed and pulled)",
-                       WARN if (ahead or behind) else PASS, msg if (ahead or behind) else msg)
-
-        _, merged = run_cmd(["git", "branch", "--merged", "HEAD"], cwd=repo)
-        branches = [b.strip().lstrip("* ") for b in merged.splitlines()
-                    if b.strip() and not b.strip().startswith("*") and b.strip() not in ("main", "master")]
-        self.check("R", "BRANCHES", "Merged branches cleaned up",
-                   WARN if branches else PASS,
-                   f"safe to delete: {', '.join(branches[:6])} (git branch -d ...)" if branches
-                   else "no stale merged branches")
-
-        _, wt = run_cmd(["git", "worktree", "list", "--porcelain"], cwd=repo)
-        wts = [l[len("worktree "):] for l in wt.splitlines() if l.startswith("worktree ")]
-        gone = [w for w in wts if not os.path.exists(w)]
-        self.check("R", "WORKTREES", "Worktrees healthy",
-                   WARN if gone else (INFO if len(wts) > 1 else PASS),
-                   f"{len(wts)} worktree(s), stale: {gone} (git worktree prune)" if gone
-                   else f"{len(wts)} worktree(s)")
-
-        _, mcnt = run_cmd(["git", "rev-list", "--merges", "--count", "HEAD"], cwd=repo)
-        n_merges = int(mcnt.strip()) if mcnt.strip().isdigit() else -1
-        self.check("R", "LINEAR", "History shape (informational)", INFO,
-                   f"{n_merges} merge commit(s)" + (" — linear" if n_merges == 0 else " — not linear"))
-
-        _, hist = run_cmd(["git", "log", "--all", "--oneline", "--", ".env", ".env.local", ".env.production"],
-                          cwd=repo)
-        self.check(0, "ENV_IN_HISTORY", ".env never committed to history",
-                   FAIL if hist.strip() else PASS,
-                   f"found in history:\n{hist[:300]}" if hist.strip() else "no .env commits found", gate=True)
-
-        todos, samples, scanned = {}, [], 0
-        for dirpath, dirnames, filenames in os.walk(repo):
-            dirnames[:] = [d for d in dirnames if d not in
-                           (".git", "node_modules", ".next", "dist", "build", "vendor", ".venv", "venv")]
-            for fn in filenames:
-                if fn.endswith((".min.js", ".lock")) or fn.startswith(".env"):
-                    continue
-                path = os.path.join(dirpath, fn)
-                try:
-                    if os.path.getsize(path) > 1_000_000:
-                        continue
-                    with open(path, encoding="utf-8", errors="ignore") as f:
-                        for i, line in enumerate(f, 1):
-                            m = TODO_RE.search(line)
-                            if m:
-                                todos[m.group(1)] = todos.get(m.group(1), 0) + 1
-                                if len(samples) < 10:
-                                    rel = os.path.relpath(path, repo)
-                                    samples.append(f"{rel}:{i}: {line.strip()[:100]}")
-                            scanned += 1
-                except OSError:
-                    continue
-        total_todos = sum(todos.values())
-        self.check("R", "TODO_SCAN", f"TODO/FIXME/XXX/HACK markers in source ({scanned} lines scanned)",
-                   WARN if total_todos else PASS,
-                   f"{total_todos} marker(s) {todos}; samples:\n  " + "\n  ".join(samples[:8]) if total_todos
-                   else "no markers found")
-        self.todo_samples = samples
-
-        spec_counts = {}
-        for fn in SPEC_FILES + ("README.md",):
-            p = os.path.join(repo, fn)
-            if os.path.exists(p):
-                try:
-                    txt = open(p, encoding="utf-8", errors="ignore").read()
-                    open_boxes = txt.count("- [ ]")
-                    done_boxes = txt.count("- [x]") + txt.count("- [X]")
-                    if open_boxes or done_boxes:
-                        spec_counts[fn] = f"{open_boxes} open / {done_boxes} done"
-                except OSError:
-                    pass
-        self.check("R", "SPECS", "Open spec/roadmap items (decision-tree: ship with them open?)",
-                   INFO if spec_counts else PASS,
-                   "; ".join(f"{k}: {v}" for k, v in spec_counts.items()) or "no checklist boxes in spec files")
-        self.spec_open = spec_counts
-
-        readme = next((os.path.join(repo, r) for r in
-                       ("README.md", "readme.md", "README.txt", "Readme.md") if os.path.exists(os.path.join(repo, r))), None)
-        if readme is None:
-            self.check("R", "README", "README exists", WARN, "no README at repo root")
-        else:
-            txt = open(readme, encoding="utf-8", errors="ignore").read()
-            stubby = STUB_RE.search(txt) or len(txt) < 400
-            self.check("R", "README", "README exists and says something real",
-                       WARN if stubby else PASS,
-                       f"{len(txt)} chars" + ("; stub/placeholder content" if STUB_RE.search(txt) else ""))
-
-        if not any(os.path.exists(os.path.join(repo, f)) for f in
-                   ("LICENSE", "LICENSE.md", "LICENSE.txt", "LICENSE-MIT", "COPYING")):
-            self.check("R", "LICENSE", "License file present", WARN,
-                       "no LICENSE at root (required if the repo is public)")
-        else:
-            self.check("R", "LICENSE", "License file present", PASS, "found")
-
-        self.run_github(repo)
-
-    def run_github(self, repo):
-        ok, _ = run_cmd(["gh", "--version"])
-        if not ok:
-            self.check("R", "GITHUB", "GitHub repo metadata (about/topics/CI)", NA,
-                       "gh CLI not installed — check About description/homepage/topics and CI state manually")
-            return
-        ok, out = run_cmd(["gh", "repo", "view", "--json",
-                           "name,description,homepageUrl,repositoryTopics,licenseInfo,isPrivate"],
-                          cwd=repo, timeout=30)
-        if not ok:
-            self.check("R", "GITHUB", "GitHub repo metadata (about/topics/CI)", NA,
-                       "gh could not read the repo (not a GitHub remote, or not authenticated)")
-            return
-        meta = {}
-        try:
-            meta = json.loads(out)
-        except json.JSONDecodeError:
-            pass
-        missing = []
-        if not meta.get("description"):
-            missing.append("About description")
-        if not meta.get("homepageUrl"):
-            missing.append("homepage URL")
-        if not meta.get("repositoryTopics"):
-            missing.append("topics")
-        self.check("R", "GITHUB_META", "GitHub About: description, homepage, topics set",
-                   WARN if missing else PASS,
-                   "missing: " + ", ".join(missing) if missing else "description, homepage, topics all set")
-        self.check("R", "GITHUB_PRIVATE", "Repo visibility (decides LICENSE/SECURITY weight)", INFO,
-                   "private" if meta.get("isPrivate") else "public")
-
-        ok, out = run_cmd(["gh", "run", "list", "-L", "1", "--json", "conclusion,status"], cwd=repo, timeout=30)
-        if ok and out.strip():
-            try:
-                runs = json.loads(out)
-                if runs:
-                    c = runs[0].get("conclusion") or runs[0].get("status")
-                    self.check("R", "CI", "Latest CI run", PASS if c == "success" else WARN, f"latest run: {c}")
-                    return
-            except json.JSONDecodeError:
-                pass
-        self.check("R", "CI", "Latest CI run", NA, "no workflow runs (no Actions configured, or none finished)")
-
-    def finish_modules(self, skip, args, crawled):
-        if "repo" not in skip and args.repo:
-            self.run_repo(args.repo)
-
-    # ---- Jev evidence + scoring ----
-    def evidence_text(self):
-        parts = [f"=== SITE UNDER AUDIT: {self.base} ===", "=== MECHANICAL AUDIT RESULTS ==="]
-        for c in self.checks:
-            if c["status"] == "INFO":
-                continue
-            parts.append(f"[{c['status']}] ({'GATE ' if c['gate'] else ''}s{c['section']}) {c['title']}: {c['evidence']}")
-        parts.append("=== PAGE EVIDENCE (first 6 pages) ===")
-        for u, p in list(self.pages.items())[:6]:
-            nav = [t for t in p.anchor_texts if t.strip()][:15]
-            btns = p.button_texts[:10]
-            parts.append(
-                f"-- {u}\n title: {p.title}\n description: {p.meta.get('description','')}\n h1: {' | '.join(p.h1s)}\n"
-                f" og:description: {p.meta.get('og:description','')}\n nav links: {nav}\n buttons: {btns}\n"
-                f" forms: {p.forms}")
-        for u, p in self.pages.items():
-            for rel, href in p.links:
-                if rel == "stylesheet":
-                    continue
-                if any(k in (rel + href).lower() for k in ("privacy", "terms", "legal")):
-                    txt = self.text(urljoin(u, href))
-                    if txt:
-                        body = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", txt))
-                        parts.append("=== POLICY PAGE (" + href + ") ===\n" + body[:1500])
-                        break
-        if getattr(self, "todo_samples", None) or getattr(self, "spec_open", None):
-            parts.append("=== REPO HYGIENE EVIDENCE ===")
-            if self.todo_samples:
-                parts.append("TODO/FIXME samples:\n  " + "\n  ".join(self.todo_samples))
-            if self.spec_open:
-                parts.append("Open spec items: " + "; ".join(f"{k}: {v}" for k, v in self.spec_open.items()))
-        if self.oauth_providers:
-            parts.append("=== OAUTH ===\nProviders detected: " + ", ".join(self.oauth_providers))
-        return "\n\n".join(parts)
-
-    def score(self, jev_answers, posture):
-        scored = [c for c in self.checks if c["status"] in (PASS, WARN, FAIL)
-                  and not c["gate"] and c["section"] not in (0, "A", "O")]
-        mech_pts = sum({PASS: 1, WARN: 0.5, FAIL: 0}[c["status"]] for c in scored)
-        mech_pct = 100 * mech_pts / len(scored) if scored else 0
-        gate_fails = [c for c in self.checks if c["gate"] and c["status"] == FAIL]
-
-        ag_items = [c for c in self.checks if c["section"] == "A" and c["status"] in (PASS, WARN, FAIL)]
-        ag_mech = 100 * sum({PASS: 1, WARN: 0.5, FAIL: 0}[c["status"]] for c in ag_items) / len(ag_items) if ag_items else None
-
-        sem_pct, agentic_pct, overall_noul = None, None, None
-        if jev_answers:
-            sem_items = [k for k in JEV_QUESTIONS
-                         if k not in ("OVERALL_PRODUCTION_GRADE", "AGENTIC_OPERABILITY", "TODO_BLOCKING")]
-            sem_pct = 100 * sum(jev_answers[k] for k in sem_items) / len(sem_items)
-            overall_noul = jev_answers["OVERALL_PRODUCTION_GRADE"]
-            if ag_mech is not None:
-                agentic_pct = 0.5 * ag_mech + 0.5 * 100 * jev_answers["AGENTIC_OPERABILITY"]
-
-        # skipped pillars are re-weighted away, never counted as zero
-        parts = [(mech_pct, 0.5)]
-        if sem_pct is not None:
-            parts.append((sem_pct, 0.35))
-        if agentic_pct is not None:
-            parts.append((agentic_pct, 0.15))
-        elif ag_mech is not None:
-            parts.append((ag_mech, 0.15))
-        wsum = sum(w for _, w in parts)
-        final = sum(v * w for v, w in parts) / wsum if wsum else 0
-
-        if gate_fails:
-            verdict = "BLOCKED"
-        elif posture == "fast":
-            verdict = "SHIP (FAST POSTURE — gates clear; report is notes, not blockers)"
-        elif final >= 90 and (overall_noul is None or overall_noul >= 0.5):
-            verdict = "PRODUCTION GRADE"
-        elif final >= 75 and (overall_noul is None or overall_noul >= 0.5):
-            verdict = "PRODUCTION GRADE WITH NOTES"
-        else:
-            verdict = "NOT PRODUCTION GRADE"
-        if (overall_noul is not None and overall_noul <= 0.2
-                and verdict.startswith("PRODUCTION") and posture != "fast"):
-            verdict = "NOT PRODUCTION GRADE (Jev overall noul %.2f)" % overall_noul
-        return {"mechanical_pct": round(mech_pct, 1), "semantic_pct": None if sem_pct is None else round(sem_pct, 1),
-                "agentic_pct": None if agentic_pct is None else round(agentic_pct, 1), "final": round(final, 1),
-                "overall_noul": overall_noul, "verdict": verdict, "gate_fails": [c["id"] for c in gate_fails],
-                "posture": posture}
-
-    def improvements(self, jev_answers):
-        """The report's second half: what to fix, in priority order. A score
-        without a plan is trivia."""
-        sec_names = {0: "site-killers", 1: "legal+trust", 2: "share+SEO", 3: "quality",
-                     "R": "repo", "D": "docs", "O": "oauth", "A": "agentic"}
-        items = []
-        for c in self.checks:
-            if c["status"] == FAIL:
-                pri = "MUST FIX" if c["gate"] else "SHOULD FIX"
-            elif c["status"] == WARN:
-                pri = "WORTH DOING"
-            elif c["status"] == NA and c["id"] in ("SECRETS", "REPO"):
-                pri = "NOT AUDITED"
-            else:
-                continue
-            why, fix = REMEDIATION.get(c["id"], ("", ""))
-            if pri == "NOT AUDITED":
-                why, fix = ("this check never ran, so a leak or mess could be hiding",
-                            "rerun with --build-dir" if c["id"] == "SECRETS"
-                            else "rerun with --repo /path/to/repo")
-            items.append({"priority": pri, "area": sec_names.get(c["section"], str(c["section"])),
-                          "id": c["id"], "title": c["title"],
-                          "evidence": (c["evidence"] or "")[:220], "why": why, "fix": fix})
-        if jev_answers:
-            for dim, noul in jev_answers.items():
-                if dim == "OVERALL_PRODUCTION_GRADE" or noul >= 0.8:
-                    continue
-                items.append({"priority": "SHOULD FIX" if noul < 0.5 else "WORTH DOING",
-                              "area": "judgment", "id": dim,
-                              "title": f"{dim} scored weak (Jev noul {noul:.2f})",
-                              "evidence": "", "why": "judgment dimension below production bar",
-                              "fix": JEV_FIX.get(dim, "")})
-        # optional gaps worth knowing about, never scored
-        for c in self.checks:
-            if c["status"] == INFO and c["evidence"].startswith("none"):
-                items.append({"priority": "OPTIONAL", "area": sec_names.get(c["section"], str(c["section"])),
-                              "id": c["id"], "title": c["title"], "evidence": c["evidence"], "why": "",
-                              "fix": REMEDIATION.get(c["id"], ("", "consider adding"))[1]})
-        order = {"MUST FIX": 0, "SHOULD FIX": 1, "WORTH DOING": 2, "NOT AUDITED": 3, "OPTIONAL": 4}
-        return sorted(items, key=lambda i: order[i["priority"]])
-
-    def strengths(self):
-        good = [c["title"] for c in self.checks
-                if c["status"] == PASS and (c["gate"] or c["section"] in (2, 3, "A"))][:6]
-        return good
-
-
-SEO_MODULE = [("TITLE", "Page title present"), ("META_DESCRIPTION", "Meta description present"),
-              ("SOCIAL_PREVIEW", "Open Graph + twitter card"), ("FAVICON", "Favicon loads"),
-              ("CANONICAL_TAG", "Canonical tag"), ("CANONICAL_HOST", "One canonical host"),
-              ("SITEMAP", "sitemap.xml present"), ("ROBOTS", "robots.txt present")]
-QUALITY_MODULE = [("NOT_FOUND", "Custom 404"), ("IMG_ALT", "Image alt attributes"),
-                  ("BROKEN_LINKS", "Links resolve"), ("VIEWPORT", "Mobile viewport")]
-AGENTIC_MODULE = [("REAL_LINKS", "Real href anchors"), ("FORM_LABELS", "Labeled inputs"),
-                  ("TEXTLESS_CONTROLS", "Named controls"), ("H1", "One h1"), ("STRUCTURE", "Heading structure")]
-
-
-class _RecordingRedirect(urllib.request.HTTPRedirectHandler):
-    def __init__(self, auditor):
-        self.auditor = auditor
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        self.auditor.redirect_chain.append(f"{code}->{newurl}")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-class PageInfo:
-    def __init__(self):
-        self.title = ""
-        self.meta = {}
-        self.links = []        # (rel, href)
-        self.h1s = []
-        self.headings = 0
-        self.imgs = []         # alt-or-None
-        self.anchors = []      # hrefs
-        self.anchor_texts = []
-        self.js_links = []     # anchors without real href
-        self.textless = []     # buttons/links with no accessible name
-        self.forms = []
-        self.unlabeled_inputs = 0
-        self.viewport = False
-        self.lang = ""
-        self.json_ld = 0
-        self.resources = []    # subresource urls
-        self.button_texts = []
-
-
-class PageParser(HTMLParser):
-    LABELABLE = ("text", "email", "tel", "password", "search", "number", "url", "date")
-
-    def __init__(self):
+@dataclass
+class Check:
+    id: str
+    section: str
+    title: str
+    status: str  # PASS WARN FAIL SKIP N/A
+    evidence: str
+    severity: str = "core"  # gate core optional info
+
+
+@dataclass
+class Page:
+    url: str
+    final_url: str
+    status: int
+    headers: dict[str, str]
+    body: str
+    error: str | None = None
+
+
+class MiniHTML(HTMLParser):
+    def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.p = PageInfo()
+        self.title_parts: list[str] = []
         self._in_title = False
-        self._btn_depth = 0
-        self._btn_text = []
-        self._in_label = False
-        self._label_ids = set()
-        self._inputs_seen = []   # (type, id, aria-label, wrapped-in-label)
-        self._h1_parts = []
+        self.metas: list[dict[str, str]] = []
+        self.links: list[dict[str, str]] = []
+        self.anchors: list[tuple[str, str]] = []
+        self.images: list[dict[str, str]] = []
+        self.forms: list[dict[str, Any]] = []
+        self._cur_form: dict[str, Any] | None = None
+        self.headings: list[tuple[str, str]] = []
+        self._cur_heading: str | None = None
+        self._heading_parts: list[str] = []
+        self.html_lang = ""
+        self.scripts_jsonld: list[str] = []
+        self._in_ld = False
+        self.text_bits: list[str] = []
+        self.inputs: list[dict[str, str]] = []
 
-    @property
-    def page(self):
-        self.p.unlabeled_inputs = sum(
-            1 for (t, iid, aria, wrapped) in self._inputs_seen
-            if t in self.LABELABLE and not wrapped and not aria and iid not in self._label_ids)
-        return self.p
-
-    def handle_starttag(self, tag, attrs):
-        a = dict(attrs)
-        p = self.p
-        if tag == "html":
-            p.lang = a.get("lang", "")
-        elif tag == "title":
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        a = {k: (v or "") for k, v in attrs}
+        if tag == "html" and a.get("lang"):
+            self.html_lang = a["lang"]
+        if tag == "title":
             self._in_title = True
-        elif tag == "meta":
-            name = a.get("name") or a.get("property") or ""
-            if name:
-                p.meta[name] = a.get("content", "")
-                if name == "viewport":
-                    p.viewport = True
-        elif tag == "link":
-            p.links.append((a.get("rel", ""), a.get("href", "")))
-        elif tag == "h1":
-            self._in_h1 = True
-            self._h1_parts = []
-            p.headings += 1
-        elif tag in ("h2", "h3"):
-            p.headings += 1
-        elif tag == "img":
-            p.imgs.append(a.get("alt"))  # None = attribute absent
-            src = a.get("src")
-            if src:
-                p.resources.append(src)
-        elif tag == "script":
-            if a.get("type") == "application/ld+json":
-                p.json_ld += 1
-            src = a.get("src")
-            if src:
-                p.resources.append(src)
-        elif tag == "a":
-            href = a.get("href")
-            self._anchor_text = []
-            self._anchor_named = bool(a.get("aria-label"))
-            if href and href not in ("#", "") and not href.startswith(("javascript:",)):
-                p.anchors.append(href)
-            else:
-                p.js_links.append(a.get("onclick", "<no-href>"))
-        elif tag == "button":
-            self._btn_depth += 1
-            self._btn_text = []
-            if a.get("aria-label"):
-                self._btn_text = [a["aria-label"]]
-        elif tag == "input":
-            self._inputs_seen.append((a.get("type", "text"), a.get("id", ""),
-                                      a.get("aria-label", ""), self._in_label))
-            if a.get("type") in ("submit", "button") and a.get("value"):
-                p.button_texts.append(a["value"])
-            src = a.get("src")
-            if src:
-                p.resources.append(src)
-        elif tag == "form":
-            p.forms.append(f"{a.get('action','(self)')} [{a.get('method','get')}]")
-        elif tag == "label":
-            self._in_label = True
-            if a.get("for"):
-                self._label_ids.add(a["for"])
+        if tag == "meta":
+            self.metas.append(a)
+        if tag == "link":
+            self.links.append(a)
+        if tag == "a":
+            self.anchors.append((a.get("href", ""), a.get("aria-label", "")))
+        if tag == "img":
+            self.images.append(a)
+        if tag == "form":
+            self._cur_form = {"attrs": a, "inputs": []}
+            self.forms.append(self._cur_form)
+        if tag in {"input", "textarea", "select"}:
+            rec = {"tag": tag, **a}
+            self.inputs.append(rec)
+            if self._cur_form is not None:
+                self._cur_form["inputs"].append(rec)
+        if tag in {"h1", "h2", "h3", "h4"}:
+            self._cur_heading = tag
+            self._heading_parts = []
+        if tag == "script" and "ld+json" in a.get("type", ""):
+            self._in_ld = True
 
-    def handle_endtag(self, tag):
+    def handle_endtag(self, tag: str) -> None:
         if tag == "title":
             self._in_title = False
-        elif tag == "h1":
-            self._in_h1 = False
-            txt = " ".join(t for t in self._h1_parts if t.strip()).strip()
-            if txt:
-                self.p.h1s.append(txt)
-        elif tag == "a":
-            txt = " ".join(t for t in getattr(self, "_anchor_text", []) if t.strip()).strip()
-            if txt:
-                self.p.anchor_texts.append(txt)
-            elif not getattr(self, "_anchor_named", False):
-                self.p.textless.append("a")
-        elif tag == "button":
-            self._btn_depth = max(0, self._btn_depth - 1)
-            txt = " ".join(self._btn_text).strip()
-            if txt:
-                self.p.button_texts.append(txt)
-            else:
-                self.p.textless.append("button")
-        elif tag == "label":
-            self._in_label = False
+        if tag == "form":
+            self._cur_form = None
+        if tag == self._cur_heading:
+            self.headings.append((tag, "".join(self._heading_parts).strip()))
+            self._cur_heading = None
+        if tag == "script":
+            self._in_ld = False
 
-    def handle_data(self, data):
+    def handle_data(self, data: str) -> None:
         if self._in_title:
-            self.p.title += data.strip()
-        elif getattr(self, "_in_h1", False):
-            if data.strip():
-                self._h1_parts.append(data.strip())
-        elif self._btn_depth and data.strip():
-            self._btn_text.append(data.strip())
-        elif getattr(self, "_anchor_text", None) is not None and data.strip():
-            self._anchor_text.append(data.strip())
+            self.title_parts.append(data)
+        if self._cur_heading:
+            self._heading_parts.append(data)
+        if self._in_ld:
+            self.scripts_jsonld.append(data)
+        if data and data.strip():
+            self.text_bits.append(data.strip())
+
+    @property
+    def title(self) -> str:
+        return re.sub(r"\s+", " ", "".join(self.title_parts)).strip()
+
+    def meta(self, name: str) -> str:
+        name_l = name.lower()
+        for m in self.metas:
+            key = (m.get("name") or m.get("property") or m.get("http-equiv") or "").lower()
+            if key == name_l:
+                return m.get("content", "")
+        return ""
 
 
-def parse_html(html):
-    parser = PageParser()
+def fetch(url: str, method: str = "GET", max_body: int = MAX_BODY) -> Page:
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": UA, "Accept": "*/*"})
+    ctx = ssl.create_default_context()
     try:
-        parser.feed(html)
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as resp:
+            raw = resp.read(max_body + 1)
+            body = raw[:max_body].decode("utf-8", "replace")
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+            return Page(url, resp.geturl(), getattr(resp, "status", 200), headers, body)
+    except urllib.error.HTTPError as e:
+        raw = e.read(max_body) if e.fp else b""
+        body = raw.decode("utf-8", "replace")
+        headers = {k.lower(): v for k, v in (e.headers.items() if e.headers else [])}
+        return Page(url, e.geturl() if hasattr(e, "geturl") else url, e.code, headers, body, str(e))
+    except Exception as e:  # noqa: BLE001 — auditor must keep going
+        return Page(url, url, 0, {}, "", str(e))
+
+
+def origin_of(url: str) -> str:
+    p = urllib.parse.urlparse(url)
+    return f"{p.scheme}://{p.netloc}"
+
+
+def with_scheme(url: str, scheme: str) -> str:
+    p = urllib.parse.urlparse(url)
+    return urllib.parse.urlunparse((scheme, p.netloc, p.path or "/", p.params, p.query, ""))
+
+
+def normalize_url(url: str) -> str:
+    url = url.strip()
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    return url
+
+
+def run_cmd(args: list[str], cwd: str | None = None, timeout: int = 20) -> tuple[int, str, str]:
+    try:
+        p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except FileNotFoundError:
+        return 127, "", f"{args[0]} not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+
+
+def parse_html(body: str) -> MiniHTML:
+    parser = MiniHTML()
+    try:
+        parser.feed(body)
         parser.close()
     except Exception:
         pass
-    return parser.page
+    return parser
 
 
-def parse_sitemap(txt):
-    try:
-        root = ET.fromstring(txt.encode())
-    except Exception:
-        return []
-    out = []
-    if root.tag.endswith("sitemapindex"):
-        for sm in root.iter("{*}loc"):
-            child = None
+def is_skipped(check_id: str, skips: set[str]) -> bool:
+    groups = {
+        "seo": {"seo_title", "seo_description", "seo_og", "seo_twitter", "seo_canonical", "seo_robots", "seo_sitemap", "seo_favicon"},
+        "agentic": {"ag_hrefs", "ag_labels", "ag_h1", "ag_viewport", "ag_lang", "ag_llms", "ag_jsonld", "ag_robots_ai"},
+        "legal": {"legal_privacy", "legal_terms", "legal_headers", "legal_consent"},
+        "quality": {"q_404", "q_links", "q_images", "q_mobile_viewport"},
+        "repo": {"repo_status", "repo_unpushed", "repo_branches", "repo_worktrees", "repo_linear", "repo_readme", "repo_license", "repo_todos", "repo_specs", "repo_security_md", "repo_github"},
+        "docs": {"docs_present", "docs_stubs"},
+        "oauth": {"oauth_detected"},
+    }
+    if check_id in skips:
+        return True
+    for g, ids in groups.items():
+        if g in skips and check_id in ids:
+            return True
+    return False
+
+
+def applicable_map(launch: str) -> dict[str, str]:
+    """Return default applicability: gate|core|optional|skip for families."""
+    base = {
+        "gates": "gate",
+        "legal": "core",
+        "seo": "core",
+        "quality": "core",
+        "oauth": "skip",
+        "docs": "optional",
+        "repo": "core",
+        "agentic": "core",
+        "ops": "optional",
+    }
+    if launch == "marketing":
+        base.update(oauth="skip", docs="optional", seo="core")
+    elif launch == "auth":
+        base.update(seo="optional", oauth="core", legal="gate", docs="optional")
+    elif launch == "api":
+        base.update(seo="optional", oauth="optional", docs="core", quality="optional")
+    elif launch == "ecommerce":
+        base.update(seo="core", oauth="core", legal="gate", docs="optional")
+    elif launch == "internal":
+        base.update(seo="skip", legal="optional", quality="optional", oauth="optional",
+                    docs="optional", repo="optional", agentic="optional")
+    return base
+
+
+def family_of(check_id: str, section: str) -> str:
+    if section == "0":
+        return "gates"
+    if check_id.startswith("legal_") or section == "1":
+        return "legal"
+    if check_id.startswith("seo_") or section == "2":
+        return "seo"
+    if check_id.startswith("q_") or section == "3":
+        return "quality"
+    if check_id.startswith("repo_") or section == "R":
+        return "repo"
+    if check_id.startswith("oauth") or section == "O":
+        return "oauth"
+    if check_id.startswith("docs_") or section == "D":
+        return "docs"
+    if check_id.startswith("ag_") or section == "A":
+        return "agentic"
+    return "quality"
+
+
+class Auditor:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.url = normalize_url(args.url)
+        self.origin = origin_of(self.url)
+        self.skips = {s.strip().lower() for s in (args.skip or "").split(",") if s.strip()}
+        if args.no_jev:
+            self.skips.add("jev")
+        if not args.repo:
+            self.skips.add("repo")
+        if not args.docs:
+            self.skips.add("docs")
+        if not args.agentic:
+            self.skips.add("agentic")
+        self.appl = applicable_map(args.launch_type)
+        self.checks: list[Check] = []
+        self.home: Page | None = None
+        self.html: MiniHTML | None = None
+        self.oauth_providers: list[str] = []
+        self.todo_samples: list[str] = []
+        self.spec_items: list[str] = []
+
+    def add(self, chk: Check) -> None:
+        if is_skipped(chk.id, self.skips) or chk.status == "SKIP":
+            chk.status = "SKIP"
+        fam = family_of(chk.id, chk.section)
+        role = self.appl.get(fam, "core")
+        if role == "skip" and chk.status != "SKIP":
+            chk.status = "N/A"
+            chk.evidence = (chk.evidence + " — not applicable for this launch type").strip(" —")
+        if role == "gate":
+            chk.severity = "gate"
+        elif role == "optional":
+            chk.severity = "optional"
+        elif role == "core":
+            chk.severity = "core"
+        self.checks.append(chk)
+
+    def run(self) -> dict[str, Any]:
+        self.home = fetch(self.url)
+        if self.home.body:
+            self.html = parse_html(self.home.body)
+        self.check_gates()
+        self.check_legal()
+        self.check_seo()
+        self.check_quality()
+        if self.args.repo:
+            self.check_repo()
+        self.check_oauth()
+        if self.args.docs:
+            self.check_docs()
+        if self.args.agentic:
+            self.check_agentic()
+        jev = self.run_jev() if "jev" not in self.skips else None
+        return self.score(jev)
+
+    def check_gates(self) -> None:
+        # HTTPS forced
+        http_url = with_scheme(self.url, "http")
+        http_page = fetch(http_url)
+        https_ok = False
+        if http_page.status in {301, 302, 303, 307, 308}:
+            loc = http_page.headers.get("location", "")
+            https_ok = loc.startswith("https://")
+        elif http_page.final_url.startswith("https://"):
+            https_ok = True
+        elif http_page.status == 0 and self.home and self.home.status and self.home.final_url.startswith("https://"):
+            # many stacks refuse raw HTTP at the edge; live HTTPS is the real gate
+            https_ok = True
+            http_page.error = http_page.error or "http probe failed; https live"
+        self.add(Check(
+            "gate_https", "0", "HTTPS forced + cert live",
+            "PASS" if (self.home and self.home.status and self.home.final_url.startswith("https://") and https_ok)
+            else "FAIL",
+            f"https status={self.home.status if self.home else 0} final={self.home.final_url if self.home else ''} "
+            f"http status={http_page.status} loc={http_page.headers.get('location','')} err={http_page.error or ''}",
+            "gate",
+        ))
+
+        # Access protection
+        final = (self.home.final_url if self.home else "").lower()
+        loc_bits = " ".join([final, (self.home.headers.get("location", "") if self.home else "")]).lower()
+        protected = any(h in loc_bits for h in PRIMARY_PROTECTION)
+        if self.home and self.home.status in {401, 403} and "vercel" in loc_bits:
+            protected = True
+        self.add(Check(
+            "gate_access", "0", "Access-protection trap",
+            "FAIL" if protected else "PASS",
+            f"status={self.home.status if self.home else 0} final={self.home.final_url if self.home else ''} "
+            f"protected={protected}",
+            "gate",
+        ))
+
+        # Root route shipped
+        root_ok = bool(self.home and self.home.status and 200 <= self.home.status < 400 and not protected)
+        self.add(Check(
+            "gate_root", "0", "Root route responds",
+            "PASS" if root_ok else "FAIL",
+            f"GET {self.url} -> {self.home.status if self.home else 0} {self.home.error or ''}",
+            "gate",
+        ))
+
+        # Secrets in build
+        if self.args.build_dir:
+            findings = scan_build_secrets(Path(self.args.build_dir))
+            self.add(Check(
+                "gate_secrets", "0", "Secrets out of the client bundle",
+                "FAIL" if findings else "PASS",
+                ("leaked: " + "; ".join(findings[:8])) if findings else f"scanned {self.args.build_dir}, no key shapes",
+                "gate",
+            ))
+        else:
+            self.add(Check(
+                "gate_secrets", "0", "Secrets out of the client bundle",
+                "N/A",
+                "pass --build-dir (.next/, dist/, out/, assets/) to enable this gate",
+                "gate",
+            ))
+
+        # Prod env hints on the page
+        body = (self.home.body if self.home else "")
+        staging_hits = re.findall(
+            r"https?://[^\s\"']+(?:ngrok|localhost|127\.0\.0\.1|staging\.|dev\.|vercel\.app/api)",
+            body,
+            re.I,
+        )
+        staging_hits = [h for h in staging_hits if "localhost" in h or "ngrok" in h or "127.0.0.1" in h][:6]
+        self.add(Check(
+            "gate_env", "0", "Prod env points at prod",
+            "FAIL" if staging_hits else "PASS",
+            ("staging/localhost URLs in HTML: " + ", ".join(staging_hits)) if staging_hits
+            else "no localhost/ngrok/staging API hosts in first-page HTML",
+            "gate",
+        ))
+
+        if self.args.repo:
+            code, out, err = run_cmd(["git", "status", "--porcelain"], cwd=self.args.repo)
+            dirty = bool(out) if code == 0 else True
+            self.add(Check(
+                "gate_shipped", "0", "Working tree shipped",
+                "FAIL" if code == 0 and dirty else ("PASS" if code == 0 else "WARN"),
+                out[:400] if out else (err or "clean working tree"),
+                "gate",
+            ))
+            hist_code, hist_out, _ = run_cmd(
+                ["git", "log", "--all", "--pretty=format:", "--name-only", "--",
+                 ".env", ".env.local", ".env.production", ".env.development"],
+                cwd=self.args.repo,
+            )
+            env_files = sorted({ln.strip() for ln in hist_out.splitlines() if ln.strip()}) if hist_code == 0 else []
+            self.add(Check(
+                "gate_env_history", "0", ".env never entered git history",
+                "FAIL" if env_files else ("PASS" if hist_code == 0 else "WARN"),
+                ("found in history: " + ", ".join(env_files) + " — rotate anything that lived there")
+                if env_files else "no .env files in git history",
+                "gate",
+            ))
+        else:
+            self.add(Check(
+                "gate_shipped", "0", "It actually shipped",
+                "N/A",
+                "pass --repo to compare working tree vs HEAD; confirm the domain serves the intended commit",
+                "gate",
+            ))
+
+    def check_legal(self) -> None:
+        html = self.html
+        body = (self.home.body if self.home else "").lower()
+        hrefs = [h.lower() for h, _ in (html.anchors if html else [])]
+        blob = " ".join(hrefs) + " " + body[:8000]
+        privacy = any(x in blob for x in ("/privacy", "privacy-policy", "privacy policy"))
+        terms = any(x in blob for x in ("/terms", "terms-of", "terms of service", "terms and conditions"))
+        consent = bool(re.search(r"cookie (consent|banner|settings)|gdpr|we use cookies", body))
+        headers = self.home.headers if self.home else {}
+        needed = ["strict-transport-security", "x-content-type-options", "referrer-policy"]
+        missing = [h for h in needed if h not in headers]
+        if "content-security-policy" not in headers:
+            missing.append("content-security-policy")
+        xfo = "x-frame-options" in headers or "frame-ancestors" in headers.get("content-security-policy", "")
+        if not xfo:
+            missing.append("x-frame-options/frame-ancestors")
+
+        self.add(Check("legal_privacy", "1", "Privacy policy reachable",
+                       "PASS" if privacy else "FAIL",
+                       "found privacy link or copy" if privacy else "no privacy policy link on home"))
+        self.add(Check("legal_terms", "1", "Terms reachable",
+                       "PASS" if terms else "WARN",
+                       "found terms link or copy" if terms else "no terms link on home"))
+        self.add(Check("legal_consent", "1", "Cookie consent only if needed",
+                       "PASS" if consent else "WARN",
+                       "consent copy present" if consent else "no cookie-consent copy detected — decide deliberately if non-essential cookies drop"))
+        self.add(Check("legal_headers", "1", "Security headers",
+                       "PASS" if not missing else "WARN",
+                       "missing: " + ", ".join(missing) if missing else "HSTS, XCTO, referrer-policy present"))
+
+    def check_seo(self) -> None:
+        html = self.html
+        title = html.title if html else ""
+        desc = html.meta("description") if html else ""
+        og_title = html.meta("og:title") if html else ""
+        og_desc = html.meta("og:description") if html else ""
+        og_img = html.meta("og:image") if html else ""
+        tw = html.meta("twitter:card") if html else ""
+        canonical = ""
+        favicon = False
+        if html:
+            for ln in html.links:
+                rel = ln.get("rel", "").lower()
+                if "canonical" in rel:
+                    canonical = ln.get("href", "")
+                if "icon" in rel:
+                    favicon = True
+        robots = fetch(urllib.parse.urljoin(self.origin + "/", "/robots.txt"))
+        sitemap = fetch(urllib.parse.urljoin(self.origin + "/", "/sitemap.xml"))
+
+        def stubby(s: str) -> bool:
+            return (not s) or s.lower() in {"home", "untitled", "document", "react app", "vite + react", "next.js"}
+
+        self.add(Check("seo_title", "2", "Unique title",
+                       "FAIL" if stubby(title) else "PASS",
+                       f"title={title!r}"))
+        self.add(Check("seo_description", "2", "Meta description",
+                       "FAIL" if not desc else ("WARN" if len(desc) < 40 else "PASS"),
+                       f"description={desc[:180]!r}"))
+        og_ok = bool(og_title and og_img)
+        self.add(Check("seo_og", "2", "Open Graph tags",
+                       "PASS" if og_ok else "WARN",
+                       f"og:title={og_title!r} og:image={'yes' if og_img else 'no'} og:description={bool(og_desc)}"))
+        self.add(Check("seo_twitter", "2", "twitter:card",
+                       "PASS" if tw else "WARN",
+                       f"twitter:card={tw!r}"))
+        self.add(Check("seo_canonical", "2", "Canonical host/tag",
+                       "PASS" if canonical else "WARN",
+                       f"canonical={canonical!r}"))
+        self.add(Check("seo_favicon", "2", "Favicon",
+                       "PASS" if favicon else "WARN",
+                       "link rel=icon present" if favicon else "no icon link"))
+        robots_ok = robots.status == 200 and "user-agent" in robots.body.lower()
+        self.add(Check("seo_robots", "2", "robots.txt present",
+                       "PASS" if robots_ok else "WARN",
+                       f"status={robots.status} bytes={len(robots.body)}"))
+        sm_ok = sitemap.status == 200 and ("<urlset" in sitemap.body or "<sitemapindex" in sitemap.body)
+        self.add(Check("seo_sitemap", "2", "sitemap.xml parseable",
+                       "PASS" if sm_ok else "WARN",
+                       f"status={sitemap.status} snippet={sitemap.body[:80]!r}"))
+
+    def check_quality(self) -> None:
+        probe = fetch(urllib.parse.urljoin(self.origin + "/", "/ship-checklist-404-probe-9f3c1"))
+        good_404 = probe.status == 404
+        self.add(Check("q_404", "3", "Custom 404 returns 404",
+                       "PASS" if good_404 else "FAIL",
+                       f"probe status={probe.status} final={probe.final_url}"))
+
+        html = self.html
+        missing_alt = 0
+        if html:
+            for img in html.images:
+                if not img.get("alt") and img.get("src") and not img.get("src").startswith("data:"):
+                    missing_alt += 1
+        self.add(Check("q_images", "3", "Images have alt",
+                       "PASS" if missing_alt == 0 else "WARN",
+                       f"{missing_alt} content images missing alt"))
+
+        vp = False
+        if html:
+            for m in html.metas:
+                if m.get("name", "").lower() == "viewport":
+                    vp = True
+        self.add(Check("q_mobile_viewport", "3", "Mobile viewport",
+                       "PASS" if vp else "FAIL",
+                       "viewport meta present" if vp else "no viewport meta"))
+
+        broken = []
+        checked = 0
+        if html:
+            seen = set()
+            for href, _ in html.anchors:
+                if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+                    continue
+                absu = urllib.parse.urljoin(self.origin + "/", href)
+                if urllib.parse.urlparse(absu).netloc != urllib.parse.urlparse(self.origin).netloc:
+                    continue
+                if absu in seen:
+                    continue
+                seen.add(absu)
+                if checked >= MAX_INTERNAL_LINKS:
+                    break
+                page = fetch(absu)
+                checked += 1
+                if page.status >= 400 and page.status not in {401, 403, 405, 429, 999}:
+                    broken.append(f"{absu} -> {page.status}")
+        # outbound links count too — a 404 to your own GitHub is still your 404
+        ext_broken, ext_checked = [], 0
+        if html:
+            seen_ext = set()
+            for href, _ in html.anchors:
+                if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+                    continue
+                absu = urllib.parse.urljoin(self.origin + "/", href)
+                if urllib.parse.urlparse(absu).netloc == urllib.parse.urlparse(self.origin).netloc:
+                    continue
+                if absu in seen_ext:
+                    continue
+                seen_ext.add(absu)
+                if ext_checked >= 40:
+                    break
+                ext_checked += 1
+                page = fetch(absu, method="HEAD")
+                if page.status == 0 or page.status >= 400:
+                    page = fetch(absu)  # some stacks reject HEAD; retry with GET
+                if page.status == 0 or (page.status >= 400 and page.status not in {401, 403, 405, 406, 429, 999}):
+                    ext_broken.append(f"{absu} -> {page.status or 'unreachable'}")
+        broken.extend(ext_broken)
+        self.add(Check("q_links", "3", "Links resolve (internal + outbound)",
+                       "FAIL" if broken else "PASS",
+                       f"checked={checked} internal, {ext_checked} outbound; broken={broken[:8] or 'none'}"))
+
+    def check_repo(self) -> None:
+        repo = self.args.repo
+        code, out, err = run_cmd(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo)
+        if code != 0:
+            self.add(Check("repo_status", "R", "Git repo", "FAIL", err or out or "not a git repo"))
+            return
+        code, out, _ = run_cmd(["git", "status", "--porcelain"], cwd=repo)
+        self.add(Check("repo_status", "R", "Clean working tree",
+                       "PASS" if not out else "WARN",
+                       out[:400] or "clean"))
+
+        code, out, err = run_cmd(["git", "status", "-sb"], cwd=repo)
+        unpushed = False
+        if code == 0:
+            unpushed = "ahead" in out or "[gone]" in out or ("..." not in out and not out.startswith("## HEAD"))
+            # "ahead" is the real signal; no upstream is a warn
+            no_upstream = "..." not in out
+        else:
+            no_upstream = True
+        self.add(Check("repo_unpushed", "R", "Commits pushed and pulled",
+                       "FAIL" if "ahead" in (out or "") else ("WARN" if no_upstream else "PASS"),
+                       out or err))
+
+        code, out, _ = run_cmd(["git", "branch", "--merged", "HEAD"], cwd=repo)
+        if code == 0:
+            merged = [b.strip().lstrip("* ") for b in out.splitlines()
+                      if b.strip() and not b.strip().startswith("*")
+                      and b.strip() not in ("main", "master")]
+            self.add(Check("repo_branches", "R", "Merged branches cleaned up",
+                           "WARN" if merged else "PASS",
+                           f"safe to delete: {', '.join(merged[:6])} (git branch -d ...)" if merged
+                           else "no stale merged branches"))
+        code, out, _ = run_cmd(["git", "worktree", "list", "--porcelain"], cwd=repo)
+        if code == 0:
+            wts = [l[len("worktree "):] for l in out.splitlines() if l.startswith("worktree ")]
+            gone = [w for w in wts if not Path(w).exists()]
+            self.add(Check("repo_worktrees", "R", "Worktrees healthy",
+                           "WARN" if gone else "PASS",
+                           f"stale: {gone} (git worktree prune)" if gone
+                           else f"{len(wts)} worktree(s) healthy"))
+        code, out, _ = run_cmd(["git", "rev-list", "--merges", "--count", "HEAD"], cwd=repo)
+        if code == 0 and out.strip().isdigit():
+            n = int(out.strip())
+            self.add(Check("repo_linear", "R", "History shape (informational)",
+                           "N/A", f"{n} merge commit(s)" + (" — linear" if n == 0 else " — not linear")))
+
+        readme = find_first(repo, ["README.md", "README.mdx", "README"])
+        stub = False
+        if readme:
+            text = Path(readme).read_text("utf-8", "replace")[:4000]
+            stub = bool(STUB_MARKERS.search(text)) or len(text.strip()) < 80
+        self.add(Check("repo_readme", "R", "README exists and is real",
+                       "FAIL" if not readme else ("WARN" if stub else "PASS"),
+                       str(readme) if readme else "no README"))
+
+        license_p = find_first(repo, ["LICENSE", "LICENSE.md", "LICENCE", "COPYING"])
+        vis = github_visibility(repo)
+        need_license = vis != "PRIVATE"
+        self.add(Check("repo_license", "R", "License present",
+                       "PASS" if license_p else ("FAIL" if need_license else "WARN"),
+                       f"{license_p or 'missing'} visibility={vis}"))
+
+        sec = find_first(repo, ["SECURITY.md", "docs/SECURITY.md"])
+        self.add(Check("repo_security_md", "R", "SECURITY.md",
+                       "PASS" if sec else "WARN",
+                       str(sec) if sec else "recommended when the app has auth"))
+
+        todos, samples = scan_todos(repo)
+        self.todo_samples = samples
+        blocking_guess = [s for s in samples if USER_FACING_TODO.search(s)]
+        status = "WARN" if todos else "PASS"
+        if self.args.posture == "portfolio" and blocking_guess:
+            status = "FAIL"
+        self.add(Check("repo_todos", "R", "TODO/FIXME scan",
+                       status,
+                       f"count={todos} samples={samples[:6]} blocking_guess={blocking_guess[:4]}"))
+
+        specs = scan_spec_boxes(repo)
+        self.spec_items = specs
+        self.add(Check("repo_specs", "R", "Open spec boxes",
+                       "WARN" if specs else "PASS",
+                       f"{len(specs)} unchecked items; ask: ship with these open? sample={specs[:5]}"))
+
+        gh = github_about(repo)
+        if gh.get("ok"):
+            missing = [k for k in ("description", "homepage", "topics") if not gh.get(k)]
+            ci = gh.get("ci")
+            self.add(Check("repo_github", "R", "GitHub About / CI",
+                           "WARN" if missing or ci not in {"pass", "success", None, "unknown"} else "PASS",
+                           json.dumps({k: gh.get(k) for k in ("description", "homepage", "topics", "visibility", "ci")})))
+        else:
+            self.add(Check("repo_github", "R", "GitHub About / CI",
+                           "N/A",
+                           gh.get("error", "gh not available; degraded")))
+
+    def check_oauth(self) -> None:
+        body = (self.home.body if self.home else "")
+        providers = detect_oauth(body, self.html)
+        self.oauth_providers = providers
+        if self.appl.get("oauth") == "skip" and not providers:
+            self.add(Check("oauth_detected", "O", "OAuth providers", "N/A", "not in scope for this launch type"))
+            return
+        self.add(Check(
+            "oauth_detected", "O", "OAuth providers detected",
+            "PASS" if providers else "WARN",
+            f"providers={providers or 'none'} — walk redirect URIs, PKCE, server-side secrets, one prod login",
+        ))
+
+    def check_docs(self) -> None:
+        path = self.args.docs_path or "/docs"
+        page = fetch(urllib.parse.urljoin(self.origin + "/", path))
+        present = page.status == 200 and len(page.body) > 80
+        stubs = bool(present and STUB_MARKERS.search(page.body))
+        self.add(Check("docs_present", "D", f"Docs at {path}",
+                       "PASS" if present else "FAIL",
+                       f"status={page.status} bytes={len(page.body)}"))
+        self.add(Check("docs_stubs", "D", "Docs are not stubs",
+                       "FAIL" if stubs else ("PASS" if present else "N/A"),
+                       "stub markers found" if stubs else "no stub markers"))
+
+    def check_agentic(self) -> None:
+        html = self.html
+        hrefs = [h for h, _ in (html.anchors if html else []) if h and not h.startswith(("javascript:",))]
+        real_hrefs = [h for h in hrefs if h and h != "#"]
+        self.add(Check("ag_hrefs", "A", "Real href anchors",
+                       "PASS" if real_hrefs else "FAIL",
+                       f"{len(real_hrefs)} real hrefs / {len(hrefs)} anchors"))
+        labeled = 0
+        unlabeled = 0
+        if html:
+            labeled_ids = set()
+            # naive: input with name/id/aria-label or associated label-for not parsed; use attrs
+            for inp in html.inputs:
+                if inp.get("type") == "hidden":
+                    continue
+                if inp.get("aria-label") or inp.get("name") or inp.get("id") or inp.get("placeholder"):
+                    labeled += 1
+                else:
+                    unlabeled += 1
+        self.add(Check("ag_labels", "A", "Labeled form inputs",
+                       "PASS" if unlabeled == 0 else "WARN",
+                       f"labeled_or_named={labeled} unlabeled={unlabeled}"))
+        h1s = [t for tag, t in (html.headings if html else []) if tag == "h1"]
+        self.add(Check("ag_h1", "A", "One h1 + heading structure",
+                       "PASS" if len(h1s) == 1 else ("WARN" if h1s else "FAIL"),
+                       f"h1={h1s[:2]} headings={len(html.headings) if html else 0}"))
+        vp = any(m.get("name", "").lower() == "viewport" for m in (html.metas if html else []))
+        self.add(Check("ag_viewport", "A", "Mobile viewport",
+                       "PASS" if vp else "FAIL",
+                       "viewport meta present" if vp else "missing"))
+        lang = html.html_lang if html else ""
+        self.add(Check("ag_lang", "A", "html lang",
+                       "PASS" if lang else "WARN",
+                       f"lang={lang!r}"))
+        llms = fetch(urllib.parse.urljoin(self.origin + "/", "/llms.txt"))
+        self.add(Check("ag_llms", "A", "llms.txt (informational)",
+                       "PASS" if llms.status == 200 else "N/A",
+                       f"status={llms.status}"))
+        robots = fetch(urllib.parse.urljoin(self.origin + "/", "/robots.txt"))
+        ai_policy = bool(re.search(r"gptbot|claudebot|google-extended|ccbot|anthropic", robots.body, re.I))
+        self.add(Check("ag_robots_ai", "A", "AI crawler policy in robots.txt",
+                       "N/A",
+                       "deliberate AI-crawler rules found" if ai_policy else "no AI-crawler tokens; reported not judged"))
+        ld = bool(html.scripts_jsonld) if html else False
+        self.add(Check("ag_jsonld", "A", "JSON-LD structured data",
+                       "PASS" if ld else "N/A",
+                       f"{len(html.scripts_jsonld) if html else 0} ld+json blocks"))
+
+    def run_jev(self) -> dict[str, Any] | None:
+        key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+        if not key:
+            return None
+        state = self.jev_state()
+        # only ask about TODOs when the repo module gathered evidence — Jev judging
+        # absence guesses conservatively and scores unfair weaks
+        questions = JEV_QUESTIONS
+        if not (getattr(self, "todo_samples", None) or getattr(self, "spec_items", None)):
+            questions = {k: v for k, v in JEV_QUESTIONS.items() if k != "TODO_BLOCKING"}
+        payload = {
+            "state": state,
+            "model": os.environ.get("TYPESAFE_DEFAULT_MODEL", "jev-latest"),
+            "questions": questions,
+        }
+        req = urllib.request.Request(
+            "https://api.typesafe.ai/v1/systemone",
+            data=json.dumps(payload).encode(),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "User-Agent": UA,
+            },
+        )
+        last_err = None
+        for attempt in range(4):
             try:
-                req = urllib.request.Request(sm.text.strip(), headers={"User-Agent": UA})
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    child = r.read().decode("utf-8", errors="replace")
-            except Exception:
-                continue
-            out.extend(parse_sitemap(child))
-    else:
-        for loc in root.iter("{*}loc"):
-            if loc.text:
-                out.append(loc.text.strip())
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+                return {"ok": True, "raw": data, "nouls": extract_nouls(data)}
+            except urllib.error.HTTPError as e:
+                last_err = f"HTTP {e.code}"
+                if e.code in {429, 529} or e.code >= 500:
+                    time.sleep(0.5 * (2 ** attempt))
+                    continue
+                body = e.read().decode("utf-8", "replace")[:300]
+                return {"ok": False, "error": f"{last_err} {body}"}
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+                time.sleep(0.4 * (2 ** attempt))
+        return {"ok": False, "error": last_err or "jev failed"}
+
+    def jev_state(self) -> str:
+        html = self.html
+        home = self.home
+        blob = {
+            "url": self.url,
+            "launch_type": self.args.launch_type,
+            "posture": self.args.posture,
+            "status": home.status if home else 0,
+            "title": html.title if html else "",
+            "description": html.meta("description") if html else "",
+            "og": {
+                "title": html.meta("og:title") if html else "",
+                "description": html.meta("og:description") if html else "",
+                "image": bool(html.meta("og:image")) if html else False,
+            },
+            "h1": [t for tag, t in (html.headings if html else []) if tag == "h1"],
+            "headings": (html.headings[:12] if html else []),
+            "cta_guess": [re.sub(r"\s+", " ", t) for t in (html.text_bits if html else []) if len(t) < 48][:30],
+            "privacy_terms_evidence": [c.id + "=" + c.status for c in self.checks if c.id.startswith("legal_")],
+            "oauth_providers": self.oauth_providers,
+            "todo_samples": self.todo_samples[:12],
+            "spec_items": self.spec_items[:12],
+            "mechanical": [{"id": c.id, "status": c.status, "evidence": c.evidence[:180]} for c in self.checks],
+            "text_sample": " ".join((html.text_bits if html else [])[:80])[:2500],
+        }
+        raw = json.dumps(blob, ensure_ascii=False)
+        return raw[:MAX_JEV_STATE]
+
+    def score(self, jev: dict[str, Any] | None) -> dict[str, Any]:
+        gates = [c for c in self.checks if c.severity == "gate" and c.status not in {"SKIP", "N/A"}]
+        gate_fail = [c for c in gates if c.status == "FAIL"]
+        mech_pool = [
+            c for c in self.checks
+            if c.severity in {"core", "optional"} and c.status in {"PASS", "WARN", "FAIL"}
+        ]
+        # optional checks that passed/failed still count if they ran; skipped stay out
+        mech_score = mean([{"PASS": 1.0, "WARN": 0.5, "FAIL": 0.0}[c.status] for c in mech_pool]) if mech_pool else None
+
+        nouls = (jev or {}).get("nouls") if jev and jev.get("ok") else None
+        sem_keys = ["COPY_CLARITY", "CTA_FOCUS", "META_QUALITY", "TRUST_LEGAL"]
+        sem_vals = [nouls[k] for k in sem_keys if nouls and k in nouls and isinstance(nouls[k], (int, float))]
+        semantic = mean(sem_vals) if sem_vals else None
+
+        ag_pool = [c for c in self.checks if c.id.startswith("ag_") and c.status in {"PASS", "WARN", "FAIL"}]
+        ag_mech = mean([{"PASS": 1.0, "WARN": 0.5, "FAIL": 0.0}[c.status] for c in ag_pool]) if ag_pool else None
+        ag_jev = nouls.get("AGENTIC_OPERABILITY") if nouls and "AGENTIC_OPERABILITY" in nouls else None
+        if ag_mech is not None and isinstance(ag_jev, (int, float)):
+            agentic = 0.5 * ag_mech + 0.5 * ag_jev
+        elif ag_mech is not None:
+            agentic = ag_mech
+        elif isinstance(ag_jev, (int, float)):
+            agentic = ag_jev
+        else:
+            agentic = None
+
+        weights = []
+        if mech_score is not None:
+            weights.append(("mechanical", 0.50, mech_score))
+        if semantic is not None:
+            weights.append(("semantic", 0.35, semantic))
+        if agentic is not None:
+            weights.append(("agentic", 0.15, agentic))
+        total_w = sum(w for _, w, _ in weights) or 1.0
+        final = sum(w * v for _, w, v in weights) / total_w if weights else 0.0
+        final_pct = round(final * 100)
+
+        todo_blocking = None
+        if nouls and "TODO_BLOCKING" in nouls:
+            todo_blocking = nouls["TODO_BLOCKING"]
+        if self.args.posture == "portfolio" and todo_blocking is not None and todo_blocking >= 0.7:
+            # treat as a gate-equivalent blocker
+            gate_fail.append(Check("todo_blocking", "R", "User-facing TODOs (Jev)", "FAIL",
+                                   f"TODO_BLOCKING noul={todo_blocking}", "gate"))
+
+        posture = self.args.posture
+        # CORE means required for a production-grade verdict: a failed core check
+        # caps the band at WITH NOTES no matter how high the weighted score is
+        core_fails = [c for c in self.checks
+                      if c.status == "FAIL" and c.severity == "core" and c not in gate_fail]
+        if gate_fail:
+            verdict = "BLOCKED"
+            exit_code = 2
+        elif posture == "fast":
+            verdict = "SHIP"
+            exit_code = 0
+        elif final_pct < 75:
+            verdict = "NOT PRODUCTION GRADE"
+            exit_code = 1
+        elif final_pct < 90:
+            verdict = "PRODUCTION GRADE WITH NOTES"
+            exit_code = 0
+        else:
+            verdict = "PRODUCTION GRADE"
+            exit_code = 0
+
+        # Jev overall noul <= 0.2 downgrades a high score; cannot rescue a low one
+        if semantic is not None and semantic <= 0.2 and verdict in {"PRODUCTION GRADE", "PRODUCTION GRADE WITH NOTES", "SHIP"}:
+            verdict = "NOT PRODUCTION GRADE"
+            exit_code = 1
+            final_pct = min(final_pct, 74)
+        if core_fails and verdict == "PRODUCTION GRADE":
+            verdict = "PRODUCTION GRADE WITH NOTES"
+
+        plan = improvement_plan(self.checks, nouls, self.args)
+        strengths = [c.title for c in self.checks if c.status == "PASS" and c.severity in {"gate", "core"}][:8]
+
+        report = {
+            "url": self.url,
+            "launch_type": self.args.launch_type,
+            "posture": posture,
+            "skipped": sorted(self.skips),
+            "oauth_providers": self.oauth_providers,
+            "open_spec_items": self.spec_items,
+            "todo_samples": self.todo_samples[:10],
+            "gates": [check_dict(c) for c in self.checks if c.severity == "gate"],
+            "checks": [check_dict(c) for c in self.checks],
+            "pillars": {
+                "mechanical": None if mech_score is None else round(mech_score * 100, 1),
+                "semantic": None if semantic is None else round(semantic * 100, 1),
+                "agentic": None if agentic is None else round(agentic * 100, 1),
+            },
+            "final": final_pct,
+            "verdict": verdict,
+            "exit_code": exit_code,
+            "jev": None if jev is None else {"ok": jev.get("ok"), "nouls": nouls, "error": jev.get("error")},
+            "solid_already": strengths,
+            "improvement_plan": plan,
+            "ops_hidden": OPS_HIDDEN,
+            "manual_required": MANUAL_REQUIRED,
+        }
+        return report
+
+
+def check_dict(c: Check) -> dict[str, str]:
+    return {
+        "id": c.id,
+        "section": c.section,
+        "title": c.title,
+        "status": c.status,
+        "severity": c.severity,
+        "evidence": c.evidence,
+    }
+
+
+def mean(xs: list[float]) -> float | None:
+    return sum(xs) / len(xs) if xs else None
+
+
+def extract_nouls(data: Any) -> dict[str, float]:
+    out: dict[str, float] = {}
+    answers = data.get("answers") or data.get("questions") or data
+    if not isinstance(answers, dict):
+        return out
+    for key, val in answers.items():
+        if isinstance(val, (int, float)):
+            out[key] = float(val)
+            continue
+        if not isinstance(val, dict):
+            continue
+        for field_name in ("noul", "p", "probability", "yes", "score"):
+            if field_name in val and isinstance(val[field_name], (int, float)):
+                out[key] = float(val[field_name])
+                break
+        else:
+            dist = val.get("distribution") or val.get("probs")
+            if isinstance(dist, dict) and "true" in dist:
+                try:
+                    out[key] = float(dist["true"])
+                except (TypeError, ValueError):
+                    pass
     return out
 
 
-def parse_ai_bots(robots_txt):
-    denies, allows = [], []
-    agent = None
-    for line in robots_txt.splitlines():
-        line = line.split("#")[0].strip()
-        if not line:
+def scan_build_secrets(root: Path) -> list[str]:
+    hits: list[str] = []
+    if not root.exists():
+        return [f"build-dir missing: {root}"]
+    for path in root.rglob("*"):
+        if not path.is_file():
             continue
-        key, _, val = line.partition(":")
-        key, val = key.strip().lower(), val.strip()
-        if key == "user-agent":
-            agent = val
-        elif key == "disallow" and val and agent and any(a.lower() == agent for a in map(str.lower, AI_BOTS)):
-            denies.append(agent)
-        elif key == "allow" and val and agent and any(a.lower() == agent for a in map(str.lower, AI_BOTS)):
-            allows.append(agent)
-    return sorted(set(denies)), sorted(set(a for a in allows if a not in denies))
-
-
-def scan_secrets(build_dir):
-    hits = {}
-    for dirpath, dirnames, filenames in os.walk(build_dir):
-        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules")]
-        for fn in filenames:
-            path = os.path.join(dirpath, fn)
-            try:
-                if os.path.getsize(path) > 5_000_000:
-                    continue
-                with open(path, encoding="utf-8", errors="ignore") as f:
-                    data = f.read()
-            except OSError:
-                continue
-            for m in SECRETS_RE.finditer(data):
-                hits.setdefault(m.group(0)[:12] + "...", []).append(path)
+        if path.suffix.lower() not in {".js", ".mjs", ".cjs", ".map", ".html", ".json", ".css"}:
+            continue
+        if path.stat().st_size > 5_000_000:
+            continue
+        try:
+            text = path.read_text("utf-8", "replace")
+        except Exception:
+            continue
+        for name, pat in SECRET_PATTERNS:
+            if pat.search(text):
+                rel = str(path)
+                hits.append(f"{name} in {rel}")
+                if len(hits) >= 20:
+                    return hits
     return hits
 
 
-def call_jev(state, api_key, questions):
-    payload = {"model": MODEL, "state": state,
-               "questions": {k: {"type": "noul", "instructions": q["instructions"], "criteria": q["criteria"]}
-                             for k, q in questions.items()}}
-    body = json.dumps(payload).encode()
-    last = None
-    for attempt in range(3):
-        req = urllib.request.Request(API_URL, data=body, headers={
-            "Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}, method="POST")
+def scan_todos(repo: str) -> tuple[int, list[str]]:
+    samples: list[str] = []
+    count = 0
+    root = Path(repo)
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in SKIP_DIR_NAMES for part in path.parts):
+            continue
+        if path.suffix.lower() not in {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".md", ".rb", ".php", ".vue", ".svelte"}:
+            continue
+        if path.stat().st_size > 400_000:
+            continue
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                return json.load(resp)
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")[:300]
-            if e.code in (429, 529) or e.code >= 500:
-                last = RuntimeError(f"HTTP {e.code}: {detail}")
-                time.sleep(2 ** attempt)
-                continue
-            raise RuntimeError(f"TypeSafe HTTP {e.code}: {detail}")
-        except urllib.error.URLError as e:
-            last = e
-            time.sleep(2 ** attempt)
-    raise RuntimeError(f"TypeSafe unreachable after retries: {last}")
+            text = path.read_text("utf-8", "replace")
+        except Exception:
+            continue
+        for m in TODO_RE.finditer(text):
+            count += 1
+            if len(samples) < 15:
+                samples.append(f"{path.relative_to(root)}: {m.group(0).strip()[:100]}")
+    return count, samples
 
 
-def main():
-    ap = argparse.ArgumentParser(description="production-readiness audit (mechanical + Jev)")
-    ap.add_argument("--url", required=True)
-    ap.add_argument("--build-dir", help="built client output to scan for secrets (.next, dist, assets)")
-    ap.add_argument("--repo", help="project repo path for git-hygiene, TODO, README, GitHub checks")
-    ap.add_argument("--docs", help="docs base URL to crawl for stubs (default: <url>/docs)")
-    ap.add_argument("--pages", type=int, default=20, help="max sitemap pages to crawl (default 20)")
-    ap.add_argument("--timeout", type=int, default=15)
-    ap.add_argument("--skip", help="comma list of modules to skip: seo,quality,agentic,repo,docs,oauth")
-    ap.add_argument("--posture", choices=("grade", "fast"), default="grade",
-                    help="fast: only site-killer gates decide; everything else is notes")
-    ap.add_argument("--no-jev", action="store_true", help="mechanical scoring only")
-    ap.add_argument("--json", action="store_true", help="machine-readable output")
-    args = ap.parse_args()
+def scan_spec_boxes(repo: str) -> list[str]:
+    items: list[str] = []
+    root = Path(repo)
+    names = ("TODO", "SPEC", "ROADMAP", "BACKLOG", "FIXME")
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in SKIP_DIR_NAMES for part in path.parts):
+            continue
+        if path.suffix.lower() not in {".md", ".txt"}:
+            continue
+        upper = path.name.upper()
+        if not any(n in upper for n in names):
+            continue
+        try:
+            text = path.read_text("utf-8", "replace")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            if SPEC_BOX.match(line):
+                items.append(f"{path.name}: {line.strip()[:120]}")
+                if len(items) >= 30:
+                    return items
+    return items
 
-    if not args.url.startswith("http"):
-        args.url = "https://" + args.url
-    aud = Auditor(args.url, args.timeout)
-    aud.sitemap_urls = []
+
+def find_first(repo: str, names: list[str]) -> str | None:
+    root = Path(repo)
+    for n in names:
+        p = root / n
+        if p.exists():
+            return str(p)
+    return None
+
+
+def github_visibility(repo: str) -> str:
+    code, out, _ = run_cmd(["gh", "repo", "view", "--json", "visibility", "-q", ".visibility"], cwd=repo)
+    if code == 0 and out:
+        return out.strip().upper()
+    return "UNKNOWN"
+
+
+def github_about(repo: str) -> dict[str, Any]:
+    code, out, err = run_cmd(
+        ["gh", "repo", "view", "--json", "description,homepageUrl,repositoryTopics,visibility"],
+        cwd=repo,
+    )
+    if code != 0:
+        return {"ok": False, "error": err or "gh repo view failed"}
     try:
-        aud.run(args)
-    except Exception as e:
-        print(f"error: audit failed: {e}", file=sys.stderr)
-        sys.exit(3)
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "unparseable gh output"}
+    topics = data.get("repositoryTopics") or data.get("topics") or []
+    if isinstance(topics, list) and topics and isinstance(topics[0], dict):
+        topics = [t.get("name") or t.get("topic") for t in topics]
+    ci_code, ci_out, _ = run_cmd(
+        ["gh", "run", "list", "--limit", "1", "--json", "conclusion,status"],
+        cwd=repo,
+    )
+    ci = "unknown"
+    if ci_code == 0 and ci_out:
+        try:
+            runs = json.loads(ci_out)
+            if runs:
+                ci = runs[0].get("conclusion") or runs[0].get("status") or "unknown"
+        except json.JSONDecodeError:
+            ci = "unknown"
+    return {
+        "ok": True,
+        "description": data.get("description") or "",
+        "homepage": data.get("homepageUrl") or "",
+        "topics": topics,
+        "visibility": (data.get("visibility") or "").upper(),
+        "ci": ci,
+    }
 
-    answers, tokens, jev_note = None, 0, ""
-    if not args.no_jev:
-        key = os.environ.get("TYPESAFE_API_KEY")
-        if not key:
-            jev_note = "TYPESAFE_API_KEY not set — verdict is mechanical-only (SEMANTIC=N/A)"
+
+def detect_oauth(body: str, html: MiniHTML | None) -> list[str]:
+    blob = body.lower()
+    found = []
+    mapping = {
+        "Google": ["accounts.google.com", "google.com/o/oauth", "sign in with google", "signinwithgoogle"],
+        "GitHub": ["github.com/login/oauth", "sign in with github"],
+        "Apple": ["appleid.apple.com", "sign in with apple"],
+        "Microsoft": ["login.microsoftonline.com", "sign in with microsoft"],
+        "X": ["api.twitter.com/oauth", "sign in with x", "sign in with twitter"],
+        "Discord": ["discord.com/api/oauth2", "sign in with discord"],
+        "Auth0": ["auth0.com", "auth0-lock"],
+        "Clerk": ["clerk.accounts", "clerk.dev", "clerk.com"],
+        "Supabase": ["supabase.co/auth", "supabase.auth"],
+        "thirdweb": ["thirdweb.com"],
+    }
+    for name, needles in mapping.items():
+        if any(n in blob for n in needles):
+            found.append(name)
+    return found
+
+
+OPS_HIDDEN = [
+    "Error monitoring wired (Sentry/Bugsnag/equivalent) and a test event received in prod",
+    "Uptime signal on the production hostname",
+    "Rollback tested — previous build redeployable in minutes",
+    "DB backups + a restore drill if the app is DB-backed",
+    "Email end-to-end (password reset not in spam). SPF/DKIM/DMARC aligned",
+    "Dependency audit (npm audit / equivalent) reviewed",
+    "2FA on hosting + registrar accounts",
+    "Admin routes unindexed and protected",
+    "API authz on every endpoint (ownership, not just authn) + rate limiting",
+    "OAuth: exact prod redirect URIs, state/PKCE, secrets server-side, account-linking decided, one full prod login",
+    "E-commerce: webhook signatures verified, no card data in logs, receipt email lands",
+]
+
+MANUAL_REQUIRED = [
+    "LCP on a throttled prod profile (target ~2.5s) — not inferred from HTML",
+    "OG image verified in a card debugger after this deploy",
+    "Analytics event visible in the prod realtime view",
+    "One form submit + one authenticated deep link if the app has auth",
+    "First-hour pass: logged-out curl, 404, login, form, analytics, one cron/function",
+]
+
+
+def improvement_plan(checks: list[Check], nouls: dict[str, float] | None, args: argparse.Namespace) -> list[dict[str, str]]:
+    plan = []
+    for c in checks:
+        if c.status not in {"FAIL", "WARN"}:
+            continue
+        if c.status == "FAIL" and c.severity == "gate":
+            pri = "MUST FIX"
+        elif c.status == "FAIL" and c.severity == "core":
+            pri = "MUST FIX" if args.posture != "fast" else "SHOULD FIX"
+        elif c.status == "FAIL":
+            pri = "SHOULD FIX"
         else:
-            try:
-                state = aud.evidence_text()[:MAX_STATE_CHARS]
-                # only ask about TODOs when the repo module actually gathered evidence —
-                # Jev judging absence guesses conservatively and scores unfair weaks
-                has_repo_evidence = bool(getattr(aud, "todo_samples", None) or getattr(aud, "spec_open", None))
-                questions = {k: q for k, q in JEV_QUESTIONS.items()
-                             if k != "TODO_BLOCKING" or has_repo_evidence}
-                resp = call_jev(state, key, questions)
-                tokens = resp.get("usage", {}).get("input_tokens", 0)
-                answers = {k: v["noul"] for k, v in resp.get("answers", {}).items()}
-                missing = [k for k in questions if k not in answers]
-                if missing:
-                    jev_note = f"Jev did not return: {', '.join(missing)}"
-                    for k in missing:
-                        answers[k] = 0.5
-            except Exception as e:
-                jev_note = f"Jev pass failed ({e}) — verdict is mechanical-only"
-                answers = None
+            pri = "SHOULD FIX" if c.severity in {"gate", "core"} else "WORTH DOING"
+        plan.append({
+            "priority": pri,
+            "item": c.title,
+            "observed": c.evidence,
+            "why": why_it_matters(c.id),
+            "fix": how_to_fix(c.id),
+        })
+    for c in checks:
+        if c.status == "N/A" and c.id == "gate_secrets":
+            plan.append({
+                "priority": "NOT AUDITED",
+                "item": c.title,
+                "observed": c.evidence,
+                "why": "Client bundles are public. A leaked live key is a site-killer.",
+                "fix": "Re-run with --build-dir pointing at the production client output.",
+            })
+    if nouls:
+        labels = {
+            "COPY_CLARITY": "Copy clarity",
+            "CTA_FOCUS": "CTA focus",
+            "META_QUALITY": "Meta quality",
+            "TRUST_LEGAL": "Trust / legal feel",
+            "AGENTIC_OPERABILITY": "Agentic operability",
+        }
+        for key, label in labels.items():
+            val = nouls.get(key)
+            if isinstance(val, (int, float)) and val < 0.6:
+                plan.append({
+                    "priority": "SHOULD FIX",
+                    "item": f"Jev {label} ({val:.2f})",
+                    "observed": f"noul={val:.2f}",
+                    "why": "Judgment dimension is below a production-grade bar.",
+                    "fix": JEV_QUESTIONS[key]["criteria"]["true"],
+                })
+    order = {"MUST FIX": 0, "SHOULD FIX": 1, "WORTH DOING": 2, "NOT AUDITED": 3, "OPTIONAL": 4}
+    plan.sort(key=lambda x: order.get(x["priority"], 9))
+    return plan
 
-    result = aud.score(answers, args.posture)
-    result["url"] = aud.base
-    result["jev_note"] = jev_note
-    result["input_tokens"] = tokens
-    result["checks"] = aud.checks
-    result["improvements"] = aud.improvements(answers)
-    result["strengths"] = aud.strengths()
 
+def why_it_matters(cid: str) -> str:
+    return {
+        "gate_https": "Browsers and OAuth providers treat mixed/expired HTTP as hostile.",
+        "gate_access": "SSO/deploy protection on the custom domain makes the site look dead to everyone but you.",
+        "gate_root": "If / does not serve the product, nothing else matters.",
+        "gate_secrets": "Anything in the client bundle is public. Rotate, do not just delete the commit.",
+        "gate_env": "The page can render while every API call still hits staging or a dead tunnel.",
+        "gate_shipped": "Uncommitted or unpushed work is not what production will run.",
+        "legal_privacy": "Auth and analytics process personal data. Missing privacy is a launch-killer in many jurisdictions.",
+        "legal_terms": "Needed when you take accounts, payments, or user content.",
+        "legal_headers": "Cheap browser guarantees (HTTPS stickiness, MIME sniffing, framing).",
+        "seo_title": "Share previews and search results will show the framework default.",
+        "seo_og": "Unfurls on chat apps decide whether anyone clicks.",
+        "q_404": "A 200 SPA fallback tells crawlers and agents the missing page exists.",
+        "q_links": "Broken internal links are the fastest way to look unshipped.",
+        "repo_todos": "User-facing TODOs are unfinished product, not chore notes.",
+        "docs_present": "API launches without docs are incomplete products.",
+        "ag_hrefs": "onclick-only navigation is invisible to agents and many assistive tools.",
+        "ag_h1": "Without a real heading, neither humans nor agents can name the page.",
+    }.get(cid, "Fails or warns the production-grade bar for this launch type.")
+
+
+def how_to_fix(cid: str) -> str:
+    return {
+        "gate_https": "Force HTTPS at the host and wait for the edge cert before announcing the domain.",
+        "gate_access": "Disable deploy/SSO protection on the production hostname. Vercel: PATCH project ssoProtection to null.",
+        "gate_root": "Confirm the production alias points at the deployment that contains the root route.",
+        "gate_secrets": "Rotate every leaked key. Rebuild without it. Check git history for .env.",
+        "gate_env": "Point CORS, OAuth redirects, webhooks, and public API URLs at the prod hostname.",
+        "gate_shipped": "Commit, push, and confirm the host built that SHA.",
+        "legal_privacy": "Add a reachable /privacy that describes real data flows. Link it in the footer.",
+        "legal_terms": "Add /terms and link it next to privacy.",
+        "legal_headers": "Set HSTS, X-Content-Type-Options=nosniff, Referrer-Policy, and a frame policy.",
+        "seo_title": "Set a per-page title that names the product.",
+        "seo_og": "Add og:title, og:description, og:image 1200x630, then recapture in a card debugger.",
+        "q_404": "Make unknown paths return HTTP 404, not the 200 app shell.",
+        "q_links": "Fix or remove the listed hrefs.",
+        "repo_todos": "Close user-facing TODOs or drop portfolio posture.",
+        "docs_present": "Ship /docs in the same deploy as the API.",
+        "ag_hrefs": "Use real <a href> for navigation.",
+        "ag_h1": "One h1 that states the page purpose; keep a heading outline.",
+    }.get(cid, "See references/checks.md for the exact bar.")
+
+
+def render_text(report: dict[str, Any]) -> str:
+    lines = []
+    lines.append(f"SHIP CHECK  {report['url']}")
+    lines.append(f"type={report['launch_type']}  posture={report['posture']}  skipped={','.join(report['skipped']) or '—'}")
+    lines.append(f"VERDICT  {report['verdict']}  score={report['final']}  exit={report['exit_code']}")
+    p = report["pillars"]
+    lines.append(
+        f"pillars  mechanical={fmt_pillar(p['mechanical'])}  "
+        f"semantic={fmt_pillar(p['semantic'])}  agentic={fmt_pillar(p['agentic'])}"
+    )
+    if report.get("oauth_providers"):
+        lines.append("oauth  " + ", ".join(report["oauth_providers"]))
+    lines.append("")
+    lines.append("GATES")
+    for c in report["gates"]:
+        lines.append(f"  {c['status']:<4} {c['title']}  — {c['evidence'][:160]}")
+    lines.append("")
+    lines.append("CHECKS")
+    for c in report["checks"]:
+        if c["severity"] == "gate":
+            continue
+        lines.append(f"  {c['status']:<4} [{c['severity']}] {c['title']}  — {c['evidence'][:140]}")
+    if report.get("jev"):
+        lines.append("")
+        lines.append("JEV")
+        if report["jev"].get("ok"):
+            for k, v in (report["jev"].get("nouls") or {}).items():
+                lines.append(f"  {k}={v:.3f}" if isinstance(v, float) else f"  {k}={v}")
+        else:
+            lines.append(f"  degraded: {report['jev'].get('error')}")
+    if report.get("solid_already"):
+        lines.append("")
+        lines.append("SOLID ALREADY")
+        for s in report["solid_already"]:
+            lines.append(f"  + {s}")
+    lines.append("")
+    lines.append("IMPROVEMENT PLAN")
+    if not report["improvement_plan"]:
+        lines.append("  (none)")
+    for item in report["improvement_plan"]:
+        lines.append(f"  [{item['priority']}] {item['item']}")
+        lines.append(f"      observed: {item['observed'][:200]}")
+        lines.append(f"      why: {item['why']}")
+        lines.append(f"      fix: {item['fix']}")
+    lines.append("")
+    lines.append("OPS_HIDDEN (ask the owner — not visible from a URL scan)")
+    for x in report["ops_hidden"]:
+        lines.append(f"  - {x}")
+    lines.append("")
+    lines.append("NOT AUDITED BY SCRIPT (do by hand or mark NOT AUDITED)")
+    for x in report["manual_required"]:
+        lines.append(f"  - {x}")
+    if report.get("open_spec_items"):
+        lines.append("")
+        lines.append("OPEN SPEC ITEMS")
+        for x in report["open_spec_items"][:20]:
+            lines.append(f"  - {x}")
+    return "\n".join(lines) + "\n"
+
+
+def fmt_pillar(v: float | None) -> str:
+    return "N/A" if v is None else f"{v:.1f}"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Production-grade ship auditor")
+    p.add_argument("--url", required=True, help="Production URL. Never localhost.")
+    p.add_argument("--build-dir", dest="build_dir", default=None)
+    p.add_argument("--repo", default=None)
+    p.add_argument("--docs", action="store_true")
+    p.add_argument("--docs-path", default="/docs")
+    p.add_argument("--agentic", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--posture", choices=["fast", "production", "portfolio"], default="production")
+    p.add_argument("--launch-type", dest="launch_type",
+                   choices=["marketing", "auth", "api", "ecommerce", "internal"], default="marketing")
+    p.add_argument("--skip", default="", help="Comma list: seo,agentic,legal,quality,repo,docs,oauth,jev")
+    p.add_argument("--no-jev", action="store_true")
+    p.add_argument("--json", action="store_true")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    parsed = urllib.parse.urlparse(normalize_url(args.url))
+    host = (parsed.hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".local"):
+        print("Refusing localhost. Several traps only exist on the production hostname.", file=sys.stderr)
+        return 2
+    auditor = Auditor(args)
+    report = auditor.run()
     if args.json:
-        print(json.dumps(result, indent=2))
+        json.dump(report, sys.stdout, indent=2)
+        sys.stdout.write("\n")
     else:
-        sec_names = {0: "0 SITE-KILLERS (gates)", 1: "1 LEGAL + TRUST", 2: "2 SHARE + SEO",
-                     3: "3 QUALITY + PERFORMANCE", "R": "R REPO READINESS", "D": "D DOCS",
-                     "O": "O OAUTH", "A": "A AGENTIC READINESS"}
-        sec_order = {0: 0, 1: 1, 2: 2, 3: 3, "R": 4, "D": 5, "O": 6, "A": 7}
-        cur = None
-        for c in sorted(aud.checks, key=lambda c: sec_order[c["section"]]):
-            if c["section"] != cur:
-                cur = c["section"]
-                print(f"\n== {sec_names[cur]} ==")
-            mark = {"PASS": "[PASS]", "WARN": "[WARN]", "FAIL": "[FAIL]", "INFO": "[info]", "N/A": "[ n/a]"}[c["status"]]
-            gate = "*" if c["gate"] else " "
-            ev = f" — {c['evidence']}" if c["evidence"] else ""
-            print(f"{mark}{gate} {c['title']}{ev}")
-        print(f"\n== SCORE (posture: {args.posture}) ==")
-        print(f"mechanical : {result['mechanical_pct']}%")
-        print(f"semantic   : {result['semantic_pct'] if result['semantic_pct'] is not None else 'N/A (no Jev)'}"
-              + (f"  (jev-latest, {tokens} in-tokens)" if tokens else ""))
-        ag_disp = f"{result['agentic_pct']}%" if result["agentic_pct"] is not None else "excluded (skipped)"
-        print(f"agentic    : {ag_disp}")
-        print(f"FINAL      : {result['final']}/100")
-        print(f"VERDICT    : {result['verdict']}")
-        if result["gate_fails"]:
-            print("gates failed: " + ", ".join(result["gate_fails"]))
-        if jev_note:
-            print(f"note       : {jev_note}")
-        print("(* = hard gate; PASS=1.0 WARN=0.5 FAIL=0 within non-gate checks; "
-              "final = 0.5*mech + 0.35*semantic + 0.15*agentic; skipped modules don't count against you)")
-
-        impr = result["improvements"]
-        if impr:
-            print("\n== IMPROVEMENT PLAN (what to do about it) ==")
-            cur = None
-            for it in impr:
-                if it["priority"] != cur:
-                    cur = it["priority"]
-                    hint = {"MUST FIX": "blocks launch", "SHOULD FIX": "costs the score",
-                            "WORTH DOING": "half credit, cheap wins", "NOT AUDITED": "rerun to cover",
-                            "OPTIONAL": "never scored, keep on radar"}[cur]
-                    print(f"\n-- {cur} ({hint}) --")
-                loc = f"[{it['area']}] " if it["area"] else ""
-                print(f"  * {loc}{it['title']}")
-                if it["evidence"]:
-                    print(f"      saw: {it['evidence']}")
-                if it["why"]:
-                    print(f"      why: {it['why']}")
-                if it["fix"]:
-                    print(f"      fix: {it['fix']}")
-        else:
-            print("\n== IMPROVEMENT PLAN ==\n  nothing to improve — every applicable check passed clean.")
-        if result["strengths"]:
-            print("\nsolid already: " + "; ".join(result["strengths"]))
-
-    gates_failed = bool(result["gate_fails"])
-    if gates_failed:
-        sys.exit(2)
-    if args.posture == "fast":
-        sys.exit(0)
-    sys.exit(0 if result["verdict"].startswith("PRODUCTION") else 1)
+        sys.stdout.write(render_text(report))
+    return int(report["exit_code"])
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

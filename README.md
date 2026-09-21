@@ -13,23 +13,23 @@ Minor details become major post-launch issues. This exists so the final pass is 
 ## Quickstart
 
 ```bash
-# gates + core checks, scored end-to-end (needs TYPESAFE_API_KEY for the Jev pass)
-python scripts/ship_audit.py --url https://yoursite.com --build-dir dist/
+# profile the launch, then run the audit
+python scripts/ship_audit.py --url https://yoursite.com \
+  --launch-type auth --posture production --build-dir .next --repo . --docs
 
-# include the repo: git hygiene, TODO scan, spec boxes, README, GitHub About/topics/CI
-python scripts/ship_audit.py --url https://yoursite.com --repo /path/to/repo
-
-# decision tree: skip what doesn't apply (SEO for an auth-gated app, say)
-python scripts/ship_audit.py --url https://yoursite.app --skip seo,agentic
-
-# ship-fast posture: only site-killer gates decide, everything else is notes
+# ship-fast posture: only site-killer gates decide
 python scripts/ship_audit.py --url https://yoursite.com --posture fast
 
-# machine-readable
-python scripts/ship_audit.py --url https://yoursite.com --json
+# decision tree: skip whole families (SEO for an auth-gated app, say)
+python scripts/ship_audit.py --url https://yoursite.app --launch-type internal --skip seo,agentic
+
+# machine-readable / no Jev
+python scripts/ship_audit.py --url https://yoursite.com --no-jev --json
 ```
 
-Exit codes: `0` production grade · `1` not production grade · `2` blocked (site-killer gate failed) · `3` error. Stdlib-only Python 3.10+ — no dependencies to install.
+Launch types: `marketing` · `auth` · `api` · `ecommerce` · `internal` — the type sets which checks are gates, core, or skipped (privacy/terms are a gate for auth and e-commerce). Localhost is refused on purpose. Exit codes: `0` production grade · `1` not production grade · `2` blocked (site-killer gate failed) · `3` error. Stdlib-only Python 3.10+ — no dependencies to install.
+
+Verdicts: `BLOCKED` · `NOT PRODUCTION GRADE` · `PRODUCTION GRADE WITH NOTES` · `PRODUCTION GRADE` · `SHIP` (fast posture, gates clear). A failed **core** check caps the verdict at WITH NOTES — core means required for production grade, whatever the weighted score says.
 
 ## What a report looks like
 
